@@ -1,7 +1,8 @@
-import { ValidationPipe } from '@nestjs/common';
+
 import { NestFactory } from '@nestjs/core';
 
 import { AppModule } from './app.module';
+import { configureHttp } from './common/configure-http';
 import { ObserveInstrument } from './observe';
 
 async function bootstrap() {
@@ -9,15 +10,7 @@ async function bootstrap() {
     instrument: ObserveInstrument,
   });
 
-  app.setGlobalPrefix('api/v1');
-
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      transform: true,
-    }),
-  );
+  configureHttp(app);
 
   // Allow mobile and web clients to access the API during development.
   app.enableCors();

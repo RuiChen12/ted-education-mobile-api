@@ -7,6 +7,13 @@ import {
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import type { App } from 'supertest/types';
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  it,
+} from 'vitest';
 
 import { configureHttp } from '../src/common/configure-http';
 

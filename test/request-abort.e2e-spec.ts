@@ -6,6 +6,13 @@ import {
 import { Test } from '@nestjs/testing';
 import { request as httpRequest, type ClientRequest } from 'node:http';
 import type { Server } from 'node:http';
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  it,
+} from 'vitest';
 
 import { configureHttp } from '../src/common/configure-http';
 import { AppLoggerService } from '../src/common/logging/logger.service';

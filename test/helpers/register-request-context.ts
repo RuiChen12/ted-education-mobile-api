@@ -1,5 +1,5 @@
 import type { INestApplication } from '@nestjs/common';
-import { jest } from '@jest/globals';
+import { vi } from 'vitest';
 
 import { AppLoggerService } from '../../src/common/logging/logger.service';
 import { RequestContextMiddleware } from '../../src/common/middleware/request-context.middleware';
@@ -15,7 +15,7 @@ export function registerRequestContext(
 ): void {
   const logger = new AppLoggerService();
 
-  jest.spyOn(logger, 'logHttpRequest').mockImplementation(() => {
+  vi.spyOn(logger, 'logHttpRequest').mockImplementation(() => {
     // Suppress log output in regression tests.
   });
 

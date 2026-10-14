@@ -9,6 +9,7 @@ import { EducationModule } from '../src/education/education.module';
 import { HealthModule } from '../src/health/health.module';
 import { ResourcesModule } from '../src/resources/resources.module';
 import { TreatmentsModule } from '../src/treatments/treatments.module';
+import { registerRequestContext } from './helpers/register-request-context';
 
 describe('API-004 Request Validation (e2e)', () => {
   let app: INestApplication<App>;
@@ -25,6 +26,7 @@ describe('API-004 Request Validation (e2e)', () => {
 
     app = moduleRef.createNestApplication();
 
+    registerRequestContext(app);
     configureHttp(app);
 
     await app.init();
@@ -42,54 +44,108 @@ describe('API-004 Request Validation (e2e)', () => {
 
   describe.each(collections)('%s collection', (endpoint) => {
     it('accepts requests without query parameters', async () => {
-      await request(app.getHttpServer())
+      const response = await request(app.getHttpServer())
         .get(`/api/v1/${endpoint}`)
         .expect(200);
+
+      expect(response.headers['x-request-id']).toEqual(
+        expect.any(String),
+      );
     });
 
     it('accepts supported language', async () => {
-      await request(app.getHttpServer())
+      const response = await request(app.getHttpServer())
         .get(`/api/v1/${endpoint}?language=en`)
         .expect(200);
+
+      expect(response.headers['x-request-id']).toEqual(
+        expect.any(String),
+      );
     });
 
     it('rejects unsupported language', async () => {
-      await request(app.getHttpServer())
+      const response = await request(app.getHttpServer())
         .get(`/api/v1/${endpoint}?language=invalid`)
         .expect(400);
+
+      expect(response.body.error.code).toBe(
+        'VALIDATION_ERROR',
+      );
+
+      expect(response.body.error.requestId).toBe(
+        response.headers['x-request-id'],
+      );
     });
 
     it('rejects unknown query fields', async () => {
-      await request(app.getHttpServer())
+      const response = await request(app.getHttpServer())
         .get(`/api/v1/${endpoint}?unknownField=test`)
         .expect(400);
+
+      expect(response.body.error.code).toBe(
+        'VALIDATION_ERROR',
+      );
+
+      expect(response.body.error.requestId).toBe(
+        response.headers['x-request-id'],
+      );
     });
 
     it('rejects long search values', async () => {
-      await request(app.getHttpServer())
+      const response = await request(app.getHttpServer())
         .get(`/api/v1/${endpoint}`)
         .query({ search: 'a'.repeat(101) })
         .expect(400);
+
+      expect(response.body.error.code).toBe(
+        'VALIDATION_ERROR',
+      );
+
+      expect(response.body.error.requestId).toBe(
+        response.headers['x-request-id'],
+      );
     });
 
     it('rejects empty category', async () => {
-      await request(app.getHttpServer())
+      const response = await request(app.getHttpServer())
         .get(`/api/v1/${endpoint}?category=`)
         .expect(400);
+
+      expect(response.body.error.code).toBe(
+        'VALIDATION_ERROR',
+      );
+
+      expect(response.body.error.requestId).toBe(
+        response.headers['x-request-id'],
+      );
     });
 
     it('returns 404 for nonexistent IDs', async () => {
-      await request(app.getHttpServer())
+      const response = await request(app.getHttpServer())
         .get(`/api/v1/${endpoint}/not-real`)
         .expect(404);
+
+      expect(response.body.error.code).toBe(
+        'RESOURCE_NOT_FOUND',
+      );
+
+      expect(response.body.error.requestId).toBe(
+        response.headers['x-request-id'],
+      );
     });
   });
 
   describe('Health endpoint', () => {
     it('returns 200 OK', async () => {
-      await request(app.getHttpServer())
+      const response = await request(app.getHttpServer())
         .get('/api/v1/health')
         .expect(200);
+
+      expect(response.body.status).toBe('ok');
+
+      expect(response.headers['x-request-id']).toEqual(
+        expect.any(String),
+      );
     });
   });
 });

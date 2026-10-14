@@ -15,6 +15,7 @@ import type { App } from 'supertest/types';
 
 import { configureHttp } from '../src/common/configure-http';
 import { EducationModule } from '../src/education/education.module';
+import { registerRequestContext } from './helpers/register-request-context';
 
 @Controller('test-errors')
 class TestErrorController {
@@ -68,6 +69,7 @@ describe('API-005 Global Exception Handling (e2e)', () => {
 
     app = moduleRef.createNestApplication();
 
+    registerRequestContext(app);
     configureHttp(app);
 
     await app.init();
@@ -86,6 +88,10 @@ describe('API-005 Global Exception Handling (e2e)', () => {
     expect(response.body.error.status).toBe(400);
     expect(response.body.error.path).toBe('/api/v1/education');
     expect(response.body.error.timestamp).toBeDefined();
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('returns BAD_REQUEST for ordinary bad requests', async () => {
@@ -94,6 +100,10 @@ describe('API-005 Global Exception Handling (e2e)', () => {
       .expect(400);
 
     expect(response.body.error.code).toBe('BAD_REQUEST');
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('preserves 401 Unauthorized', async () => {
@@ -102,6 +112,10 @@ describe('API-005 Global Exception Handling (e2e)', () => {
       .expect(401);
 
     expect(response.body.error.code).toBe('UNAUTHORIZED');
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('preserves 403 Forbidden', async () => {
@@ -110,6 +124,10 @@ describe('API-005 Global Exception Handling (e2e)', () => {
       .expect(403);
 
     expect(response.body.error.code).toBe('FORBIDDEN');
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('preserves 404 Not Found', async () => {
@@ -117,7 +135,13 @@ describe('API-005 Global Exception Handling (e2e)', () => {
       .get('/api/v1/education/not-real')
       .expect(404);
 
-    expect(response.body.error.code).toBe('RESOURCE_NOT_FOUND');
+    expect(response.body.error.code).toBe(
+      'RESOURCE_NOT_FOUND',
+    );
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('preserves 409 Conflict', async () => {
@@ -126,6 +150,10 @@ describe('API-005 Global Exception Handling (e2e)', () => {
       .expect(409);
 
     expect(response.body.error.code).toBe('CONFLICT');
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('handles other HTTP status codes safely', async () => {
@@ -135,6 +163,10 @@ describe('API-005 Global Exception Handling (e2e)', () => {
 
     expect(response.body.error.code).toBe('HTTP_ERROR');
     expect(response.body.error.status).toBe(429);
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('hides internal error details for unexpected errors', async () => {
@@ -142,10 +174,16 @@ describe('API-005 Global Exception Handling (e2e)', () => {
       .get('/api/v1/test-errors/unexpected')
       .expect(500);
 
-    expect(response.body.error.code).toBe('INTERNAL_SERVER_ERROR');
+    expect(response.body.error.code).toBe(
+      'INTERNAL_SERVER_ERROR',
+    );
     expect(response.body.error.status).toBe(500);
     expect(response.body.error.message).toBe(
       'An internal error occurred.',
+    );
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
     );
 
     const body = JSON.stringify(response.body);
@@ -160,15 +198,23 @@ describe('API-005 Global Exception Handling (e2e)', () => {
       .get('/api/v1/test-errors/service-unavailable')
       .expect(503);
 
-    expect(response.body.error.code).toBe('INTERNAL_SERVER_ERROR');
+    expect(response.body.error.code).toBe(
+      'INTERNAL_SERVER_ERROR',
+    );
     expect(response.body.error.status).toBe(503);
     expect(response.body.error.message).toBe(
       'An internal error occurred.',
     );
 
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
+
     const body = JSON.stringify(response.body);
 
-    expect(body).not.toContain('INTERNAL_DATABASE_CONNECTION_FAILED');
+    expect(body).not.toContain(
+      'INTERNAL_DATABASE_CONNECTION_FAILED',
+    );
     expect(body).not.toContain('stack');
     expect(body).not.toContain('node_modules');
   });
@@ -185,8 +231,13 @@ describe('API-005 Global Exception Handling (e2e)', () => {
         status: 404,
         path: '/api/v1/education/not-real',
         timestamp: expect.any(String),
+        requestId: expect.any(String),
       },
     });
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('returns a valid ISO timestamp', async () => {
@@ -194,10 +245,14 @@ describe('API-005 Global Exception Handling (e2e)', () => {
       .get('/api/v1/test-errors/bad-request')
       .expect(400);
 
-    const timestamp = response.body.error.timestamp;
+    const timestamp: string = response.body.error.timestamp;
 
     expect(typeof timestamp).toBe('string');
     expect(new Date(timestamp).toISOString()).toBe(timestamp);
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 
   it('does not expose query parameters in the error path', async () => {
@@ -207,5 +262,9 @@ describe('API-005 Global Exception Handling (e2e)', () => {
 
     expect(response.body.error.path).toBe('/api/v1/education');
     expect(response.body.error.path).not.toContain('private-value');
+
+    expect(response.body.error.requestId).toBe(
+      response.headers['x-request-id'],
+    );
   });
 });

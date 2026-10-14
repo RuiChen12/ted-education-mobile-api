@@ -1,4 +1,3 @@
-
 import {
   ArgumentsHost,
   Catch,
@@ -6,7 +5,9 @@ import {
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
-import type { Request, Response } from 'express';
+import type { Response } from 'express';
+
+import type { RequestWithContext } from '../types/request-context.types';
 
 type ApiErrorCode =
   | 'VALIDATION_ERROR'
@@ -25,6 +26,7 @@ type ApiErrorResponse = {
     status: number;
     path: string;
     timestamp: string;
+    requestId: string;
   };
 };
 
@@ -32,7 +34,7 @@ type ApiErrorResponse = {
 export class HttpExceptionFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {
     const context = host.switchToHttp();
-    const request = context.getRequest<Request>();
+    const request = context.getRequest<RequestWithContext>();
     const response = context.getResponse<Response>();
 
     const status =
@@ -43,6 +45,11 @@ export class HttpExceptionFilter implements ExceptionFilter {
     const code = this.getErrorCode(status, exception);
     const message = this.getSafeMessage(code);
 
+    // The request ID is created by RequestContextMiddleware.
+    // Never generate a second ID inside the exception filter.
+    // Preserve the original HTTP status if the ID is missing.
+    const requestId = request.requestId ?? '';
+
     const errorResponse: ApiErrorResponse = {
       error: {
         code,
@@ -50,6 +57,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
         status,
         path: request.path,
         timestamp: new Date().toISOString(),
+        requestId,
       },
     };
 

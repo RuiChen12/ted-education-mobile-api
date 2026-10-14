@@ -1,8 +1,14 @@
-
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
 import type { App } from 'supertest/types';
+import {
+  beforeAll,
+  afterAll,
+  describe,
+  expect,
+  it,
+} from 'vitest';
 
 import { configureHttp } from '../src/common/configure-http';
 import { EducationModule } from '../src/education/education.module';

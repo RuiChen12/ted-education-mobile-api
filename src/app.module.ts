@@ -1,14 +1,16 @@
-import {
-  MiddlewareConsumer,
-  Module,
-  NestModule,
-} from '@nestjs/common';
+
+import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
+import { APP_GUARD } from '@nestjs/core';
+import {
+  ThrottlerGuard,
+  ThrottlerModule,
+} from '@nestjs/throttler';
 
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { createRateLimitConfig } from './common/config/rate-limit.config';
 import { AppLoggerService } from './common/logging/logger.service';
-import { RequestContextMiddleware } from './common/middleware/request-context.middleware';
 import { EducationModule } from './education/education.module';
 import { HealthModule } from './health/health.module';
 import { ObserveModule } from './observe';
@@ -20,6 +22,12 @@ import { TreatmentsModule } from './treatments/treatments.module';
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: '.env.local',
+    }),
+
+    ThrottlerModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: createRateLimitConfig,
     }),
 
     ObserveModule.forRootAsync({
@@ -38,12 +46,13 @@ import { TreatmentsModule } from './treatments/treatments.module';
     ResourcesModule,
   ],
   controllers: [AppController],
-  providers: [AppService, AppLoggerService],
+  providers: [
+    AppService,
+    AppLoggerService,
+    {
+      provide: APP_GUARD,
+      useClass: ThrottlerGuard,
+    },
+  ],
 })
-export class AppModule implements NestModule {
-  configure(consumer: MiddlewareConsumer): void {
-    consumer
-      .apply(RequestContextMiddleware)
-      .forRoutes('{*path}');
-  }
-}
+export class AppModule {}

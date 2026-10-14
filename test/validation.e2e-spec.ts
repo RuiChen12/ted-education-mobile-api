@@ -1,8 +1,10 @@
-import { INestApplication, ValidationPipe } from '@nestjs/common';
+
+import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
-import { App } from 'supertest/types';
+import type { App } from 'supertest/types';
 
+import { configureHttp } from '../src/common/configure-http';
 import { EducationModule } from '../src/education/education.module';
 import { HealthModule } from '../src/health/health.module';
 import { ResourcesModule } from '../src/resources/resources.module';
@@ -23,15 +25,7 @@ describe('API-004 Request Validation (e2e)', () => {
 
     app = moduleRef.createNestApplication();
 
-    app.setGlobalPrefix('api/v1');
-
-    app.useGlobalPipes(
-      new ValidationPipe({
-        whitelist: true,
-        forbidNonWhitelisted: true,
-        transform: true,
-      }),
-    );
+    configureHttp(app);
 
     await app.init();
   });

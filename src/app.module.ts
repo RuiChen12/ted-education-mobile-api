@@ -11,6 +11,7 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { createRateLimitConfig } from './common/config/rate-limit.config';
 import { AppLoggerService } from './common/logging/logger.service';
+import { validateEnv } from './config/env.validation';
 import { EducationModule } from './education/education.module';
 import { HealthModule } from './health/health.module';
 import { ObserveModule } from './observe';
@@ -22,6 +23,7 @@ import { TreatmentsModule } from './treatments/treatments.module';
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: '.env.local',
+      validate: validateEnv,
     }),
 
     ThrottlerModule.forRootAsync({

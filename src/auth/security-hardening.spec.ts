@@ -10,8 +10,8 @@ import {
 } from '@nestjs/common';
 
 import { createHmac } from 'node:crypto';
-import { AuthSessionService } from './auth-session.service';
-import { EmailVerificationService } from './email-verification.service';
+import { AuthSessionService } from './sessions/auth-session.service';
+import { EmailVerificationService } from './email/email-verification.service';
 
 const sid =
   '11111111-1111-4111-8111-111111111111';
@@ -27,35 +27,58 @@ const digest = createHmac('sha256', secret)
   .digest('hex');
 
 function harness(usedAt: Date) {
-  const prisma = {
+  const user = {
+    id: uid,
+    isActive: true,
+    passwordHash: null,
+    emailVerifiedAt: null,
+    sessionVersion: 1,
+  };
+
+  const session = {
+    id: sid,
+    userId: uid,
+    tokenHash: 'b'.repeat(64),
+    revokedAt: null,
+    expiresAt: new Date(Date.now() + 600000),
+    absoluteExpiresAt: new Date(Date.now() + 600000),
+    sessionVersion: 1,
+    user,
+  };
+
+  const tx = {
+    $queryRaw: vi.fn().mockResolvedValue([]),
+
+    user: {
+      findUnique: vi.fn().mockResolvedValue(user),
+    },
+
     authSession: {
-      findUnique: vi.fn().mockResolvedValue({
-        id: sid,
-        userId: uid,
-        tokenHash: 'b'.repeat(64),
-        revokedAt: null,
-        expiresAt: new Date(Date.now() + 600000),
-        absoluteExpiresAt: new Date(
-          Date.now() + 600000,
-        ),
-        sessionVersion: 1,
-        user: {
-          isActive: true,
-          passwordHash: null,
-          emailVerifiedAt: null,
-          sessionVersion: 1,
-        },
-      }),
+      findUnique: vi.fn().mockResolvedValue(session),
+      findFirst: vi.fn().mockResolvedValue(session),
       updateMany: vi.fn().mockResolvedValue({
         count: 1,
       }),
     },
+
     usedRefreshToken: {
       findUnique: vi.fn().mockResolvedValue({
         sessionId: sid,
         usedAt,
       }),
     },
+
+    securityEvent: {
+      create: vi.fn().mockResolvedValue({}),
+    },
+  };
+
+  const prisma = {
+    ...tx,
+    $transaction: vi.fn(
+      async (fn: (client: typeof tx) => Promise<unknown>) =>
+        fn(tx),
+    ),
   };
 
   const service = new AuthSessionService(
@@ -97,6 +120,7 @@ describe('Authentication hardening', () => {
       expect.objectContaining({
         where: {
           id: sid,
+          userId: uid,
           revokedAt: null,
         },
       }),
@@ -124,47 +148,87 @@ describe('Authentication hardening', () => {
   });
 
   it('reserves email quota atomically', async () => {
-    const prisma = {
-      user: {
-        findUnique: vi.fn().mockResolvedValue({
-          id: uid,
-          isActive: true,
-          passwordHash: 'hash',
-          emailVerifiedAt: null,
-        }),
-      },
-      $queryRaw: vi.fn().mockResolvedValue([]),
+    const user = {
+      id: uid,
+      email: 'test@example.com',
+      isActive: true,
+      passwordHash: 'hash',
+      emailVerifiedAt: null,
+      sessionVersion: 1,
     };
 
-    const service = new EmailVerificationService(
-      prisma as never,
-      {
-        get: (key: string) =>
-          key === 'RESEND_API_KEY'
-            ? 'key'
-            : 'from@example.com',
-        getOrThrow: () => secret,
-      } as never,
-    );
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
 
-    const result = await service.requestCode(
-      ' TEST@example.com ',
-    );
+      user: {
+        findUnique: vi.fn().mockResolvedValue(user),
+      },
 
-    expect(result.message).toContain('code');
+      emailVerificationCode: {
+        findUnique: vi.fn().mockResolvedValue(null),
+        upsert: vi.fn().mockResolvedValue({}),
+      },
+    };
 
-    expect(
-      prisma.$queryRaw,
-    ).toHaveBeenCalledOnce();
+    const prisma = {
+      ...tx,
+      $transaction: vi.fn(
+        async (fn: (client: typeof tx) => Promise<unknown>) =>
+          fn(tx),
+      ),
+    };
 
-    expect(
-      prisma.user.findUnique,
-    ).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: {
-          email: 'test@example.com',
-        },
-      }),
-    );
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('{}', { status: 200 }));
+
+    try {
+      const service = new EmailVerificationService(
+        prisma as never,
+        {
+          get: (key: string) =>
+            key === 'RESEND_API_KEY'
+              ? 'test-key'
+              : 'from@example.test',
+          getOrThrow: () => secret,
+        } as never,
+      );
+
+      const result = await service.requestCode(
+        ' TEST@example.com ',
+      );
+
+      expect(result.message).toContain('code');
+
+      expect(prisma.$transaction).toHaveBeenCalledOnce();
+      expect(tx.$queryRaw).toHaveBeenCalledOnce();
+
+      expect(tx.user.findUnique).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { email: 'test@example.com' },
+        }),
+      );
+
+      expect(tx.emailVerificationCode.upsert)
+        .toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { userId: uid },
+            create: expect.objectContaining({
+              userId: uid,
+              attempts: 0,
+              sentInWindow: 1,
+              codeHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+            }),
+          }),
+        );
+
+      expect(fetchMock).toHaveBeenCalledOnce();
+
+      expect(
+        tx.emailVerificationCode.upsert.mock.invocationCallOrder[0]
+      ).toBeLessThan(fetchMock.mock.invocationCallOrder[0]);
+
+    } finally {
+      fetchMock.mockRestore();
+    }
   });
 });

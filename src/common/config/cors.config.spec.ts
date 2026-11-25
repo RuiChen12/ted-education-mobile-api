@@ -112,6 +112,7 @@ describe('API-007 CORS Configuration (unit)', () => {
       'Content-Type',
       'Authorization',
       'X-Request-ID',
+      'X-TED-Platform',
     ]);
   });
 

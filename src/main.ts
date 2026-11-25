@@ -22,6 +22,8 @@ async function bootstrap() {
   // Configure interactive OpenAPI documentation.
   configureSwagger(app);
 
+  app.enableShutdownHooks();
+
   await app.listen(
     process.env.PORT ?? 3000,
     '0.0.0.0',

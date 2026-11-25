@@ -20,6 +20,12 @@ enum Gender {
 }
 
 model User {
+  mfaLoginChallenge MfaLoginChallenge?
+  securityNotifications SecurityNotification[]
+  passwordResetSentInWindow Int @default(0)
+  passwordResetWindowStartedAt DateTime?
+  passwordResetLastSentAt DateTime?
+
   id                    String                 @id @default(uuid()) @db.Uuid
   email                 String                 @unique @db.VarChar(254)
   fullName              String                 @db.VarChar(120)
@@ -35,6 +41,9 @@ model User {
   passwordResetCode     PasswordResetCode?
   emailVerificationCode EmailVerificationCode?
   authSessions          AuthSession[]
+  securityEvents SecurityEvent[]
+  emailChangeRequest EmailChangeRequest?
+  googleActionChallenge GoogleActionChallenge?
   gender                Gender?
   role                  Role                   @default(PATIENT)
   avatarUrl             String?
@@ -98,6 +107,8 @@ model EmailVerificationCode {
 }
 
 model AuthSession {
+  devicePlatform String? @db.VarChar(16)
+  lastActiveAt DateTime?
   id                String    @id @default(uuid()) @db.Uuid
   userId            String    @db.Uuid
   tokenHash         String    @unique @db.VarChar(64)
@@ -122,4 +133,134 @@ model UsedRefreshToken {
   session AuthSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@index([sessionId])
+}
+
+model AvatarCleanupJob {
+  objectKey String   @id
+  attempts  Int      @default(0)
+  notBefore DateTime
+  createdAt DateTime @default(now())
+
+  @@index([notBefore])
+}
+
+enum SecurityEventType {
+  SESSION_CREATED
+  SESSION_REVOKED
+  SIGNED_OUT
+  ALL_SESSIONS_REVOKED
+  PASSWORD_CHANGED
+  PASSWORD_RESET
+  MFA_ENABLED
+  MFA_DISABLED
+  RECOVERY_CODES_REGENERATED
+  EMAIL_CHANGED
+  GOOGLE_LINKED
+  GOOGLE_UNLINKED
+  PASSWORD_LOGIN_FAILED
+  MFA_VERIFICATION_FAILED
+  REFRESH_TOKEN_REPLAY
+}
+
+model SecurityEvent {
+  id        String            @id @default(uuid()) @db.Uuid
+  userId    String            @db.Uuid
+  type      SecurityEventType
+  createdAt DateTime          @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, type, createdAt])
+  @@index([userId, createdAt, id])
+  @@index([createdAt])
+}
+
+model EmailChangeRequest {
+  userId            String   @id @db.Uuid
+  requestId         String   @unique @db.Uuid
+  sessionId         String   @db.Uuid
+  sessionVersion    Int
+  oldEmail          String   @db.VarChar(254)
+  newEmail          String   @db.VarChar(254)
+  oldCodeHash       String   @db.VarChar(64)
+  newCodeHash       String   @db.VarChar(64)
+  attempts          Int      @default(0)
+  sentAt            DateTime
+  expiresAt         DateTime
+  sentInWindow      Int
+  windowStartedAt   DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+enum GoogleSensitiveAction {
+  SET_PASSWORD
+  EXPORT_DATA
+  DELETE_ACCOUNT
+}
+
+model GoogleActionChallenge {
+  userId          String                @id @db.Uuid
+  requestId       String                @unique @db.Uuid
+  sessionId       String                @db.Uuid
+  sessionVersion  Int
+  action          GoogleSensitiveAction
+  googleSubject   String                @db.VarChar(255)
+  email           String                @db.VarChar(254)
+  codeHash        String                @db.VarChar(64)
+  attempts        Int                   @default(0)
+  sentAt          DateTime
+  expiresAt       DateTime
+  consumedAt      DateTime?
+  sentInWindow    Int
+  windowStartedAt DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+model SecurityNotification {
+  language String @default("en") @db.VarChar(8)
+  id          String            @id @default(uuid()) @db.Uuid
+  userId      String            @db.Uuid
+  recipient   String            @db.VarChar(254)
+  kind        SecurityEventType
+  attempts    Int               @default(0)
+  notBefore   DateTime          @default(now())
+  claimId     String?           @db.Uuid
+  deliveredAt DateTime?
+  failedAt    DateTime?
+  createdAt   DateTime          @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([deliveredAt, failedAt, notBefore])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+
+model MfaLoginChallenge {
+  userId         String   @id @db.Uuid
+  challengeId    String   @unique @db.Uuid
+  sessionVersion Int
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+}
+
+model RateLimitBucket {
+  key       String   @id @db.VarChar(64)
+  hits      Int
+  blocked   Boolean  @default(false)
+  expiresAt DateTime
+
+  @@index([expiresAt])
 }

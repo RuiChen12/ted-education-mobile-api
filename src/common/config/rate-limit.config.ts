@@ -22,8 +22,10 @@ export function createRateLimitConfig(
   if (
     !Number.isSafeInteger(ttl) ||
     ttl <= 0 ||
+    ttl > 604800000 ||
     !Number.isSafeInteger(limit) ||
-    limit <= 0
+    limit <= 0 ||
+    limit > 1000000
   ) {
     throw new Error('Invalid API rate limit configuration.');
   }

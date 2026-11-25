@@ -1,27 +1,32 @@
-﻿import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   UnauthorizedException,
 } from '@nestjs/common';
 import type { ExecutionContext } from '@nestjs/common';
 import { hash } from 'bcryptjs';
 
 import { AuthService } from './auth.service';
-import { JwtAuthGuard } from './jwt-auth.guard';
-import { MfaService } from './mfa.service';
+import { JwtAuthGuard } from './jwt/jwt-auth.guard';
+import { MfaService } from './mfa/mfa.service';
 import { UpdateAccountDto } from './dto/update-account.dto';
 
 const USER_ID = '11111111-1111-4111-8111-111111111111';
 
 function authHarness() {
-  const prisma = {
+  const tx = {
     user: {
       findUnique: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
     },
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    authSession: { findFirst: vi.fn().mockResolvedValue({ id: USER_ID }) },
   };
+  tx.user.findUnique.mockResolvedValue({ isActive: true, sessionVersion: 2, passwordHash: null, emailVerifiedAt: null });
+  const prisma = { ...tx, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
 
   const mfa = {
     loginResult: vi.fn(),
@@ -31,7 +36,6 @@ function authHarness() {
     prisma as never,
     {} as never,
     mfa as never,
-    {} as never,
   );
 
   return { prisma, mfa, service };
@@ -174,20 +178,22 @@ describe('TED password login regression', () => {
 
 describe('TED MFA login result', () => {
   it('requires a challenge when MFA is enabled', async () => {
-    const prisma = {
-      mfaSetting: {
-        findUnique: vi.fn().mockResolvedValue({
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      user: { findUnique: vi.fn().mockResolvedValue({ id: USER_ID, isActive: true, sessionVersion: 3, passwordHash: null }) },
+      mfaSetting: { findUnique: vi.fn().mockResolvedValue({
           enabledAt: new Date(),
-        }),
-      },
+        }) },
+      mfaLoginChallenge: { upsert: vi.fn().mockResolvedValue({}), deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
     };
+    const prisma = { ...tx, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
 
     const jwt = {
       signAsync: vi.fn().mockResolvedValue('challenge'),
     };
 
     const sessions = {
-      issue: vi.fn().mockResolvedValue({
+      issueInTransaction: vi.fn().mockResolvedValue({
         mfaRequired: false,
         accessToken: 'access-token',
         refreshToken: 'refresh-token',
@@ -217,6 +223,7 @@ describe('TED MFA login result', () => {
       expect.objectContaining({
         purpose: 'mfa',
         sv: 3,
+        jti: expect.any(String),
       }),
       expect.objectContaining({
         expiresIn: '5m',
@@ -225,18 +232,20 @@ describe('TED MFA login result', () => {
   });
 
   it('issues an access token when MFA is disabled', async () => {
-    const prisma = {
-      mfaSetting: {
-        findUnique: vi.fn().mockResolvedValue(null),
-      },
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      user: { findUnique: vi.fn().mockResolvedValue({ id: USER_ID, isActive: true, sessionVersion: 2, passwordHash: null }) },
+      mfaSetting: { findUnique: vi.fn().mockResolvedValue(null) },
+      mfaLoginChallenge: { upsert: vi.fn().mockResolvedValue({}), deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
     };
+    const prisma = { ...tx, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
 
     const jwt = {
       signAsync: vi.fn().mockResolvedValue('access-token'),
     };
 
     const sessions = {
-      issue: vi.fn().mockResolvedValue({
+      issueInTransaction: vi.fn().mockResolvedValue({
         mfaRequired: false,
         accessToken: 'access-token',
         refreshToken: 'refresh-token',
@@ -262,7 +271,8 @@ describe('TED MFA login result', () => {
       accessToken: 'access-token',
     });
 
-    expect(sessions.issue).toHaveBeenCalledWith(USER_ID, 2);
+    expect(sessions.issueInTransaction).toHaveBeenCalledWith(tx, USER_ID, 2);
+    expect(tx.mfaLoginChallenge.deleteMany).toHaveBeenCalledWith({ where: { userId: USER_ID } });
   });
 });
 
@@ -283,6 +293,7 @@ function guardHarness(
         userId: USER_ID,
         revokedAt: null,
         expiresAt: new Date(Date.now() + 600000),
+        absoluteExpiresAt: new Date(Date.now() + 1200000), lastActiveAt: new Date(),
         sessionVersion: 2,
       }),
     },
@@ -349,7 +360,7 @@ describe('TED JWT access protection', () => {
         sub: USER_ID,
         purpose: 'access',
         sid: USER_ID,
-        sv: 1,
+        sv: 1, exp: Math.floor(Date.now() / 1000) + 600,
       },
       {
         id: USER_ID,
@@ -369,7 +380,7 @@ describe('TED JWT access protection', () => {
         sub: USER_ID,
         purpose: 'access',
         sid: USER_ID,
-        sv: 2,
+        sv: 2, exp: Math.floor(Date.now() / 1000) + 600,
       },
       {
         id: USER_ID,
@@ -410,7 +421,7 @@ describe('TED onboarding profile persistence', () => {
       onboardingStep: 2,
     };
 
-    await service.updateAccount(USER_ID, dto);
+    await service.updateAccount(USER_ID, dto, USER_ID);
 
     expect(prisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -434,7 +445,7 @@ describe('TED onboarding profile persistence', () => {
 
     await service.updateAccount(USER_ID, {
       completeOnboarding: true,
-    });
+    }, USER_ID);
 
     expect(prisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -452,17 +463,20 @@ describe('TED onboarding profile persistence', () => {
     await expect(
       service.updateAccount(USER_ID, {
         fullName: ' ',
-      }),
+      }, USER_ID),
     ).rejects.toBeInstanceOf(BadRequestException);
 
     expect(prisma.user.update).not.toHaveBeenCalled();
   });
 });
 
-// Known, intentionally deferred issue.
-// This is not counted as a successful security test.
-describe('Known security gap', () => {
-  it.todo(
-    'Email/password accounts must verify mailbox ownership before full access',
-  );
+// Mailbox ownership is now enforced.
+
+describe('Mailbox ownership enforcement', () => {
+  it('Email/password accounts must verify mailbox ownership before full access', async () => {
+    const { service, prisma, mfa } = authHarness();
+    prisma.user.findUnique.mockResolvedValue({ id: USER_ID, isActive: true, passwordHash: await hash('CorrectPassword123!', 4), emailVerifiedAt: null, sessionVersion: 2 });
+    await expect(service.login({ email: 'patient@example.com', password: 'CorrectPassword123!' })).rejects.toBeInstanceOf(ForbiddenException);
+    expect(mfa.loginResult).not.toHaveBeenCalled();
+  });
 });

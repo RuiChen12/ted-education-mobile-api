@@ -1,3 +1,6 @@
+import { lockSecurityActivityUser } from './security/security-activity.service';
+import { recordLimitedSecurityEvent } from './security/security-activity.service';
+import { enqueueSecurityNotification } from '../notifications/security-notification.service';
 
 import {
   BadRequestException,
@@ -6,7 +9,6 @@ import {
   Injectable,
 } from '@nestjs/common';
 import { Prisma, Role } from '@prisma/client';
-import { ConfigService } from '@nestjs/config';
 import { compare, hash } from 'bcryptjs';
 import { JwtService } from '@nestjs/jwt';
 import { UnauthorizedException } from '@nestjs/common';
@@ -14,7 +16,7 @@ import { UnauthorizedException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
-import { MfaService } from './mfa.service';
+import { MfaService } from './mfa/mfa.service';
 import { UpdateAccountDto } from './dto/update-account.dto';
 
 @Injectable()
@@ -23,7 +25,6 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly mfa: MfaService,
-    private readonly config: ConfigService,
   ) {}
 
   async login(dto: LoginDto) {
@@ -35,6 +36,38 @@ export class AuthService {
 
     if (!user || !user.isActive || !user.passwordHash ||
         !(await compare(dto.password, user.passwordHash))) {
+      if (user?.isActive && user.passwordHash) {
+        try {
+          await this.prisma.$transaction(async tx => {
+            await lockSecurityActivityUser(tx, user.id);
+
+            const current = await tx.user.findFirst({
+              where: {
+                id: user.id,
+                isActive: true,
+                passwordHash: user.passwordHash,
+                sessionVersion: user.sessionVersion,
+              },
+              select: { id: true },
+            });
+
+            if (current) {
+              await recordLimitedSecurityEvent(
+                tx,
+                current.id,
+                'PASSWORD_LOGIN_FAILED',
+              );
+            }
+          }, {
+            maxWait: 1000,
+            timeout: 2000,
+          });
+        } catch {
+          // Preserve the original authentication error.
+          // Audit failure must not allow authentication.
+        }
+      }
+
       throw new UnauthorizedException('Invalid email or password.');
     }
 
@@ -101,50 +134,76 @@ export class AuthService {
     userId: string,
     currentPassword: string,
     newPassword: string,
+    sessionId: string,
+    mfaCode?: string,
   ) {
+
     if (
-      newPassword.length < 12 ||
+      typeof newPassword !== 'string' ||
+      Array.from(newPassword).length < 12 ||
       Buffer.byteLength(newPassword, 'utf8') > 72
     ) {
       throw new BadRequestException(
-        'New password must have at least 12 characters and at most 72 UTF-8 bytes.',
+        'New password must contain at least 12 characters and at most 72 UTF-8 bytes.',
       );
     }
 
-    const user = await this.prisma.user.findUnique({
+    if (
+      typeof currentPassword !== 'string' ||
+      !currentPassword ||
+      Buffer.byteLength(currentPassword, 'utf8') > 72
+    ) {
+      throw new BadRequestException(
+        'Current password is incorrect.',
+      );
+    }
+
+    const snapshot = await this.prisma.user.findUnique({
       where: { id: userId },
       select: {
         id: true,
         email: true,
         isActive: true,
         passwordHash: true,
+        emailVerifiedAt: true,
+        sessionVersion: true,
       },
     });
 
-    if (!user || !user.isActive) {
-      throw new UnauthorizedException('Sign in again.');
+    if (!snapshot?.isActive) {
+      throw new UnauthorizedException(
+        'Sign in again.',
+      );
     }
 
-    if (!user.passwordHash) {
+    if (!snapshot.passwordHash) {
       throw new BadRequestException(
         'This account has no password. Use the linked sign-in provider.',
       );
     }
 
+    if (!snapshot.emailVerifiedAt) {
+      throw new BadRequestException(
+        'Email verification is required.',
+      );
+    }
+
+    const currentPasswordHash = snapshot.passwordHash;
+
     const valid = await compare(
       currentPassword,
-      user.passwordHash,
+      currentPasswordHash,
     );
 
     if (!valid) {
-      throw new UnauthorizedException(
+      throw new BadRequestException(
         'Current password is incorrect.',
       );
     }
 
     const reused = await compare(
       newPassword,
-      user.passwordHash,
+      currentPasswordHash,
     );
 
     if (reused) {
@@ -153,87 +212,190 @@ export class AuthService {
       );
     }
 
-    const passwordHash = await hash(newPassword, 12);
+    // Perform expensive hashing outside database locks.
 
-    // Update password and revoke sessions atomically.
-    await this.prisma.$transaction(async (tx) => {
-      const changed = await tx.user.updateMany({
-        where: {
-          id: user.id,
-          passwordHash: user.passwordHash,
-          isActive: true,
-        },
-        data: {
-          passwordHash,
-          sessionVersion: { increment: 1 },
-        },
-      });
+    const passwordHash = await hash(
+      newPassword,
+      12,
+    );
 
-      if (changed.count !== 1) {
-        throw new ConflictException(
-          'Account changed. Sign in again and retry.',
-        );
-      }
+    const changed = await this.prisma.$transaction(
+      async tx => {
+        // Lock the account before checking the snapshot.
 
-      await tx.authSession.updateMany({
-        where: {
-          userId: user.id,
-          revokedAt: null,
-        },
-        data: {
-          revokedAt: new Date(),
-        },
-      });
-    });
+        await tx.$queryRaw`
+          SELECT "id"
+          FROM "User"
+          WHERE "id" = ${userId}::uuid
+          FOR UPDATE
+        `;
 
-    // Email notification is best-effort.
-    // Mail failure must not undo the password change.
-    const apiKey = this.config
-      .get<string>('RESEND_API_KEY')?.trim();
-
-    const from = this.config
-      .get<string>('RESET_EMAIL_FROM')?.trim();
-
-    if (apiKey && from) {
-      try {
-        const response = await fetch(
-          'https://api.resend.com/emails',
-          {
-            method: 'POST',
-            headers: {
-              Authorization: 'Bearer ' + apiKey,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              from,
-              to: [user.email],
-              subject: 'TED Education: Your password was changed',
-              text:
-                'Your TED Education password was changed. ' +
-                'If this was not you, contact TED support immediately.',
-            }),
-            signal: AbortSignal.timeout(4000),
+        const current = await tx.user.findFirst({
+          where: {
+            id: userId,
+            email: snapshot.email,
+            isActive: true,
+            passwordHash: currentPasswordHash,
+            sessionVersion: snapshot.sessionVersion,
+            emailVerifiedAt: { not: null },
           },
-        );
+          select: {
+            id: true,
+          },
+        });
 
-        if (!response.ok) {
-          console.warn(
-            'Password-change notification could not be delivered.'
+        if (!current) {
+          throw new ConflictException(
+            'Account changed. Sign in again.',
           );
         }
-      } catch {
-        console.warn(
-          'Password-change notification could not be delivered.'
-        );
-      }
+
+        // Validate the active session and consume MFA
+        // within this same database transaction.
+
+        const mfaValid =
+          await this.mfa.verifySensitiveActionInTransaction(
+            tx,
+            userId,
+            sessionId,
+            snapshot.sessionVersion,
+            mfaCode,
+          );
+
+        if (!mfaValid) {
+          // Return false rather than throwing so failed
+          // MFA attempt counters can be committed.
+          return false;
+        }
+
+        const now = new Date();
+
+        const updated = await tx.user.updateMany({
+          where: {
+            id: userId,
+            email: snapshot.email,
+            isActive: true,
+            passwordHash: currentPasswordHash,
+            sessionVersion: snapshot.sessionVersion,
+            emailVerifiedAt: { not: null },
+          },
+          data: {
+            passwordHash,
+            sessionVersion: { increment: 1 },
+          },
+        });
+
+        if (updated.count !== 1) {
+          throw new ConflictException(
+            'Account changed. Sign in again.',
+          );
+        }
+
+        // Recheck and revoke the requesting session.
+
+        const currentSession =
+          await tx.authSession.updateMany({
+            where: {
+              id: sessionId,
+              userId,
+              sessionVersion: snapshot.sessionVersion,
+              revokedAt: null,
+              expiresAt: { gt: now },
+              absoluteExpiresAt: { gt: now },
+            },
+            data: {
+              revokedAt: now,
+            },
+          });
+
+        if (currentSession.count !== 1) {
+          throw new UnauthorizedException(
+            'Session expired. Sign in again.',
+          );
+        }
+
+        // Revoke all other sessions.
+
+        await tx.authSession.updateMany({
+          where: {
+            userId,
+            revokedAt: null,
+          },
+          data: {
+            revokedAt: now,
+          },
+        });
+
+        // Remove obsolete password reset codes.
+        // Account-level sending quota is preserved.
+
+        await tx.passwordResetCode.deleteMany({
+          where: { userId },
+        });
+
+        // Invalidate email verification codes without
+        // deleting their sending-quota history.
+
+        await tx.emailVerificationCode.updateMany({
+          where: { userId },
+          data: {
+            attempts: 5,
+          },
+        });
+
+        // Invalidate existing email change requests
+        // while preserving their rate-limit history.
+
+        await tx.emailChangeRequest.updateMany({
+          where: { userId },
+          data: {
+            attempts: 5,
+          },
+        });
+
+        // Invalidate outstanding Google action challenges
+        // without resetting their rate-limit history.
+
+        await tx.googleActionChallenge.updateMany({
+          where: {
+            userId,
+            consumedAt: null,
+          },
+          data: {
+            consumedAt: now,
+          },
+        });
+
+        await tx.securityEvent.create({
+          data: {
+            userId,
+            type: 'PASSWORD_CHANGED',
+          },
+        });
+
+        await enqueueSecurityNotification(tx, userId, 'PASSWORD_CHANGED');
+
+        return true;
+      },
+    );
+
+    if (!changed) {
+      throw new BadRequestException(
+        'A valid current authenticator code is required.',
+      );
     }
+
 
     return {
       message: 'Password changed. All sessions have been revoked.',
     };
   }
 
-  async updateAccount(userId: string, dto: UpdateAccountDto) {
+  async updateAccount(
+    userId: string,
+    dto: UpdateAccountDto,
+    sessionId: string,
+  ) {
     const values: Prisma.UserUpdateInput = {};
 
     if (dto.fullName !== undefined) {
@@ -259,8 +421,58 @@ export class AuthService {
       values.onboardingCompletedAt = new Date();
     }
 
-    return this.prisma.user.update({
-      where: { id: userId },
+    return this.prisma.$transaction(async tx => {
+      await lockSecurityActivityUser(tx, userId);
+
+      const current = await tx.user.findUnique({
+        where: { id: userId },
+        select: {
+          isActive: true,
+          sessionVersion: true,
+          passwordHash: true,
+          emailVerifiedAt: true,
+        },
+      });
+
+      if (
+        !current?.isActive ||
+        (current.passwordHash && !current.emailVerifiedAt)
+      ) {
+        throw new UnauthorizedException(
+          'Sign in again.',
+        );
+      }
+
+      await tx.$queryRaw`
+        SELECT "id"
+        FROM "AuthSession"
+        WHERE "id" = ${sessionId}::uuid
+          AND "userId" = ${userId}::uuid
+        FOR UPDATE
+      `;
+
+      const now = new Date();
+
+      const session = await tx.authSession.findFirst({
+        where: {
+          id: sessionId,
+          userId,
+          sessionVersion: current.sessionVersion,
+          revokedAt: null,
+          expiresAt: { gt: now },
+          absoluteExpiresAt: { gt: now },
+        },
+        select: { id: true },
+      });
+
+      if (!session) {
+        throw new UnauthorizedException(
+          'Session expired or revoked. Sign in again.',
+        );
+      }
+
+      return tx.user.update({
+        where: { id: userId },
       data: values,
       select: {
         id: true, email: true, fullName: true, gender: true,
@@ -268,6 +480,7 @@ export class AuthService {
         highContrast: true, onboardingStep: true,
         onboardingCompletedAt: true
       }
+      });
     });
   }
 }

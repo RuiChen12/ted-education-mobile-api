@@ -21,13 +21,17 @@ import { UpdateAccountDto } from './dto/update-account.dto';
 const USER_ID = '11111111-1111-4111-8111-111111111111';
 
 function makeAuth() {
-  const prisma = {
+  const tx = {
     user: {
       findUnique: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
     },
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    authSession: { findFirst: vi.fn().mockResolvedValue({ id: USER_ID }) },
   };
+  tx.user.findUnique.mockResolvedValue({ isActive: true, sessionVersion: 2, passwordHash: null, emailVerifiedAt: null });
+  const prisma = { ...tx, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
 
   const mfa = {
     loginResult: vi.fn(),
@@ -37,7 +41,6 @@ function makeAuth() {
     prisma as never,
     {} as never,
     mfa as never,
-    {} as never,
   );
 
   return { service, prisma, mfa };
@@ -167,7 +170,7 @@ describe('AuthService profile update branches', () => {
       highContrast: true,
       onboardingStep: 2,
       completeOnboarding: false,
-    });
+    }, USER_ID);
 
     expect(prisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -191,7 +194,7 @@ describe('AuthService profile update branches', () => {
       id: USER_ID,
     });
 
-    await service.updateAccount(USER_ID, {});
+    await service.updateAccount(USER_ID, {}, USER_ID);
 
     expect(prisma.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -314,12 +317,13 @@ describe('AuthController route delegation', () => {
     const dto = { preferredLanguage: 'ja' };
 
     await controller.profile({
-      user: { id: USER_ID },
+      user: { id: USER_ID }, sessionId: USER_ID,
     }, dto);
 
     expect(auth.updateAccount).toHaveBeenCalledWith(
       USER_ID,
       dto,
+      USER_ID,
     );
   });
 });

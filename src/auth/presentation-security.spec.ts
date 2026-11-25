@@ -1,4 +1,4 @@
-﻿import {
+import {
   describe,
   expect,
   it,
@@ -11,23 +11,26 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 
-import { MfaService } from './mfa.service';
-import { PasswordResetService } from './password-reset.service';
-import { GoogleAuthService } from './google-auth.service';
+import { MfaService } from './mfa/mfa.service';
+import { PasswordResetService } from './password/password-reset.service';
+import { GoogleAuthService } from './google/google-auth.service';
 
 const USER_ID =
   '11111111-1111-4111-8111-111111111111';
 
 function mfaHarness() {
-  const prisma = {
+  const tx = {
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    authSession: { findFirst: vi.fn().mockResolvedValue({ id: USER_ID }) },
     mfaSetting: {
       findUnique: vi.fn(),
       upsert: vi.fn(),
     },
     user: {
-      findUnique: vi.fn(),
+      findUnique: vi.fn().mockResolvedValue({ id: USER_ID, email: 'patient@example.com', isActive: true, sessionVersion: 2, passwordHash: null }),
     },
   };
+  const prisma = { ...tx, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
 
   const jwt = {
     signAsync: vi.fn().mockResolvedValue('token'),
@@ -89,7 +92,7 @@ describe('MFA security regression', () => {
     });
 
     await expect(
-      service.setup(USER_ID, 'patient@example.com')
+      service.setup(USER_ID, USER_ID)
     ).rejects.toBeInstanceOf(ConflictException);
 
     expect(prisma.mfaSetting.upsert)
@@ -105,7 +108,7 @@ describe('MFA security regression', () => {
 
     const result = await service.setup(
       USER_ID,
-      'patient@example.com'
+      USER_ID
     );
 
     expect(result.uri).toContain('otpauth://totp/');
@@ -126,7 +129,7 @@ describe('MFA security regression', () => {
     prisma.mfaSetting.findUnique.mockResolvedValue(null);
 
     await expect(
-      service.enable(USER_ID, '123456')
+      service.enable(USER_ID, '123456', USER_ID)
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 
@@ -161,7 +164,7 @@ describe('MFA security regression', () => {
 
     jwt.verifyAsync.mockResolvedValue({
       sub: USER_ID,
-      purpose: 'mfa',
+      purpose: 'mfa', jti: USER_ID, exp: Math.floor(Date.now() / 1000) + 600,
       sv: 2,
     });
 
@@ -180,7 +183,7 @@ describe('MFA security regression', () => {
 
     jwt.verifyAsync.mockResolvedValue({
       sub: USER_ID,
-      purpose: 'mfa',
+      purpose: 'mfa', jti: USER_ID, exp: Math.floor(Date.now() / 1000) + 600,
       sv: 1,
     });
 
@@ -196,7 +199,8 @@ describe('MFA security regression', () => {
 });
 
 function resetHarness() {
-  const prisma = {
+  const tx = {
+    $queryRaw: vi.fn().mockResolvedValue([]),
     user: {
       findUnique: vi.fn(),
     },
@@ -205,6 +209,7 @@ function resetHarness() {
       updateMany: vi.fn(),
     },
   };
+  const prisma = { ...tx, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
 
   const config = {
     get: vi.fn(),
@@ -283,8 +288,7 @@ describe('Password recovery security regression', () => {
     const { service, prisma } = resetHarness();
 
     prisma.user.findUnique.mockResolvedValue({
-      id: USER_ID,
-      isActive: true,
+      id: USER_ID, isActive: true, email: 'patient@example.com', passwordHash: 'old-hash', sessionVersion: 2,
     });
 
     prisma.passwordResetCode.findUnique.mockResolvedValue({
@@ -306,8 +310,7 @@ describe('Password recovery security regression', () => {
     const { service, prisma } = resetHarness();
 
     prisma.user.findUnique.mockResolvedValue({
-      id: USER_ID,
-      isActive: true,
+      id: USER_ID, isActive: true, email: 'patient@example.com', passwordHash: 'old-hash', sessionVersion: 2,
     });
 
     prisma.passwordResetCode.findUnique.mockResolvedValue({
@@ -329,8 +332,7 @@ describe('Password recovery security regression', () => {
     const { service, prisma } = resetHarness();
 
     prisma.user.findUnique.mockResolvedValue({
-      id: USER_ID,
-      isActive: true,
+      id: USER_ID, isActive: true, email: 'patient@example.com', passwordHash: 'old-hash', sessionVersion: 2,
     });
 
     prisma.passwordResetCode.findUnique.mockResolvedValue({

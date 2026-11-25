@@ -7,6 +7,7 @@ import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 
 const UID = '11111111-1111-4111-8111-111111111111';
+const SID = '22222222-2222-4222-8222-222222222222';
 const OLD = 'ExistingPassword123!';
 const NEXT = 'CompletelyNewPassword456!';
 let oldHash: string;
@@ -21,31 +22,28 @@ afterEach(() => {
 });
 
 function harness() {
-  const user = {
-    id: UID,
-    email: 'patient@example.com',
-    isActive: true,
-    passwordHash: oldHash,
-  };
+  const user = { id: UID, email: 'patient@example.com', isActive: true,
+    passwordHash: oldHash, emailVerifiedAt: new Date(), sessionVersion: 3,
+    preferredLanguage: 'en' };
   const tx = {
-    user: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
-    authSession: { updateMany: vi.fn().mockResolvedValue({ count: 2 }) },
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    user: { findFirst: vi.fn().mockResolvedValue({ id: UID }),
+      findUnique: vi.fn().mockResolvedValue(user), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    authSession: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    passwordResetCode: { deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    emailVerificationCode: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    emailChangeRequest: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    googleActionChallenge: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    securityEvent: { create: vi.fn().mockResolvedValue({}) },
+    securityNotification: { create: vi.fn().mockResolvedValue({}) },
   };
   const prisma = {
     user: { findUnique: vi.fn().mockResolvedValue(user) },
     $transaction: vi.fn(async (callback: (client: typeof tx) => Promise<unknown>) => callback(tx)),
   };
-  const settings: Record<string, string | undefined> = {};
-  const config = {
-    get: vi.fn((key: string) => settings[key]),
-  };
-  const service = new AuthService(
-    prisma as never,
-    {} as never,
-    {} as never,
-    config as never,
-  );
-  return { service, prisma, tx, config, settings, user };
+  const mfa = { verifySensitiveActionInTransaction: vi.fn().mockResolvedValue(true) };
+  const service = new AuthService(prisma as never, {} as never, mfa as never);
+  return { service, prisma, tx, mfa, user };
 }
 
 describe('Change password: all observable success and failure paths', () => {
@@ -54,7 +52,7 @@ describe('Change password: all observable success and failure paths', () => {
     ['more than 72 UTF-8 bytes', '界'.repeat(25)],
   ])('rejects a %s new password before querying the user', async (_label, newPassword) => {
     const h = harness();
-    await expect(h.service.changePassword(UID, OLD, newPassword))
+    await expect(h.service.changePassword(UID, OLD, newPassword, SID))
       .rejects.toBeInstanceOf(BadRequestException);
     expect(h.prisma.user.findUnique).not.toHaveBeenCalled();
   });
@@ -62,7 +60,7 @@ describe('Change password: all observable success and failure paths', () => {
   it('rejects an account that no longer exists', async () => {
     const h = harness();
     h.prisma.user.findUnique.mockResolvedValue(null);
-    await expect(h.service.changePassword(UID, OLD, NEXT))
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID))
       .rejects.toBeInstanceOf(UnauthorizedException);
     expect(h.prisma.$transaction).not.toHaveBeenCalled();
   });
@@ -70,27 +68,27 @@ describe('Change password: all observable success and failure paths', () => {
   it('rejects a disabled account', async () => {
     const h = harness();
     h.prisma.user.findUnique.mockResolvedValue({ ...h.user, isActive: false });
-    await expect(h.service.changePassword(UID, OLD, NEXT))
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID))
       .rejects.toBeInstanceOf(UnauthorizedException);
   });
 
   it('rejects an OAuth-only account without a password', async () => {
     const h = harness();
     h.prisma.user.findUnique.mockResolvedValue({ ...h.user, passwordHash: null });
-    await expect(h.service.changePassword(UID, OLD, NEXT))
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID))
       .rejects.toBeInstanceOf(BadRequestException);
   });
 
   it('rejects the wrong current password', async () => {
     const h = harness();
-    await expect(h.service.changePassword(UID, 'WrongPassword123!', NEXT))
-      .rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(h.service.changePassword(UID, 'WrongPassword123!', NEXT, SID))
+      .rejects.toBeInstanceOf(BadRequestException);
     expect(h.prisma.$transaction).not.toHaveBeenCalled();
   });
 
   it('rejects password reuse even if the caller knows the current password', async () => {
     const h = harness();
-    await expect(h.service.changePassword(UID, OLD, OLD))
+    await expect(h.service.changePassword(UID, OLD, OLD, SID))
       .rejects.toBeInstanceOf(BadRequestException);
     expect(h.prisma.$transaction).not.toHaveBeenCalled();
   });
@@ -98,7 +96,7 @@ describe('Change password: all observable success and failure paths', () => {
   it('refuses a stale concurrent account update', async () => {
     const h = harness();
     h.tx.user.updateMany.mockResolvedValue({ count: 0 });
-    await expect(h.service.changePassword(UID, OLD, NEXT))
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID))
       .rejects.toBeInstanceOf(ConflictException);
     expect(h.tx.authSession.updateMany).not.toHaveBeenCalled();
   });
@@ -106,17 +104,17 @@ describe('Change password: all observable success and failure paths', () => {
   it('propagates session revocation errors instead of claiming success', async () => {
     const h = harness();
     h.tx.authSession.updateMany.mockRejectedValue(new Error('transaction aborted'));
-    await expect(h.service.changePassword(UID, OLD, NEXT))
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID))
       .rejects.toThrow('transaction aborted');
   });
 
   it('hashes the new password and revokes existing sessions in one transaction', async () => {
     const h = harness();
-    const result = await h.service.changePassword(UID, OLD, NEXT);
+    const result = await h.service.changePassword(UID, OLD, NEXT, SID);
     expect(result.message).toContain('sessions have been revoked');
     expect(h.prisma.$transaction).toHaveBeenCalledTimes(1);
     expect(h.tx.user.updateMany).toHaveBeenCalledWith({
-      where: { id: UID, passwordHash: oldHash, isActive: true },
+      where: { id: UID, email: h.user.email, passwordHash: oldHash, isActive: true, sessionVersion: 3, emailVerifiedAt: { not: null } },
       data: {
         passwordHash: expect.any(String),
         sessionVersion: { increment: 1 },
@@ -125,72 +123,52 @@ describe('Change password: all observable success and failure paths', () => {
     const saved = h.tx.user.updateMany.mock.calls[0][0].data.passwordHash as string;
     expect(saved).not.toBe(oldHash);
     expect(await compare(NEXT, saved)).toBe(true);
+    expect(h.mfa.verifySensitiveActionInTransaction).toHaveBeenCalledWith(h.tx, UID, SID, 3, undefined);
+    expect(h.tx.authSession.updateMany).toHaveBeenCalledTimes(2);
     expect(h.tx.authSession.updateMany).toHaveBeenCalledWith({
       where: { userId: UID, revokedAt: null },
       data: { revokedAt: expect.any(Date) },
     });
   });
 
-  it('does not email when only the API key is set', async () => {
+  it('does not change a password without verified email', async () => {
     const h = harness();
-    h.settings.RESEND_API_KEY = 'test-key';
-    const mockedFetch = vi.fn();
-    vi.stubGlobal('fetch', mockedFetch);
-    await h.service.changePassword(UID, OLD, NEXT);
-    expect(mockedFetch).not.toHaveBeenCalled();
+    h.prisma.user.findUnique.mockResolvedValue({ ...h.user, emailVerifiedAt: null });
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID)).rejects.toBeInstanceOf(BadRequestException);
+    expect(h.prisma.$transaction).not.toHaveBeenCalled();
   });
 
-  it('does not email when only the sender address is set', async () => {
+  it('commits failed MFA without changing credentials', async () => {
     const h = harness();
-    h.settings.RESET_EMAIL_FROM = 'support@example.com';
-    const mockedFetch = vi.fn();
-    vi.stubGlobal('fetch', mockedFetch);
-    await h.service.changePassword(UID, OLD, NEXT);
-    expect(mockedFetch).not.toHaveBeenCalled();
+    h.mfa.verifySensitiveActionInTransaction.mockResolvedValue(false);
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID, '123456')).rejects.toBeInstanceOf(BadRequestException);
+    expect(h.mfa.verifySensitiveActionInTransaction).toHaveBeenCalledWith(h.tx, UID, SID, 3, '123456');
+    expect(h.tx.user.updateMany).not.toHaveBeenCalled();
+    expect(h.tx.securityNotification.create).not.toHaveBeenCalled();
   });
 
-  it('sends a best-effort notification using trimmed configuration', async () => {
+  it('queues verified-recipient notification instead of sending inside transaction', async () => {
     const h = harness();
-    h.settings.RESEND_API_KEY = '  key  ';
-    h.settings.RESET_EMAIL_FROM = '  support@example.com  ';
-    const mockedFetch = vi.fn().mockResolvedValue({ ok: true });
-    vi.stubGlobal('fetch', mockedFetch);
-    await h.service.changePassword(UID, OLD, NEXT);
-    expect(mockedFetch).toHaveBeenCalledWith(
-      'https://api.resend.com/emails',
-      expect.objectContaining({
-        method: 'POST',
-        headers: expect.objectContaining({ Authorization: 'Bearer key' }),
-      }),
-    );
-    const sent = JSON.parse(mockedFetch.mock.calls[0][1].body as string);
-    expect(sent.to).toEqual([h.user.email]);
-    expect(sent.from).toBe('support@example.com');
+    const send = vi.fn(); vi.stubGlobal('fetch', send);
+    await h.service.changePassword(UID, OLD, NEXT, SID);
+    expect(send).not.toHaveBeenCalled();
+    expect(h.tx.securityNotification.create).toHaveBeenCalledWith({ data: { userId: UID, recipient: h.user.email, kind: 'PASSWORD_CHANGED', language: 'en' } });
+    expect(h.tx.passwordResetCode.deleteMany).toHaveBeenCalledWith({ where: { userId: UID } });
+    expect(h.tx.emailVerificationCode.updateMany).toHaveBeenCalledWith({ where: { userId: UID }, data: { attempts: 5 } });
+    expect(h.tx.emailChangeRequest.updateMany).toHaveBeenCalledWith({ where: { userId: UID }, data: { attempts: 5 } });
+    expect(h.tx.googleActionChallenge.updateMany).toHaveBeenCalledWith({ where: { userId: UID, consumedAt: null }, data: { consumedAt: expect.any(Date) } });
   });
 
-  it('does not revert a password change when the mail provider returns an error', async () => {
-    const h = harness();
-    h.settings.RESEND_API_KEY = 'key';
-    h.settings.RESET_EMAIL_FROM = 'support@example.com';
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 500 }));
-    await expect(h.service.changePassword(UID, OLD, NEXT)).resolves.toMatchObject({
-      message: expect.stringContaining('Password changed'),
-    });
-    expect(warn).toHaveBeenCalled();
-    expect(h.tx.authSession.updateMany).toHaveBeenCalled();
+  it('rejects an expired requesting session', async () => {
+    const h = harness(); h.tx.authSession.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID)).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(h.tx.securityNotification.create).not.toHaveBeenCalled();
   });
 
-  it('does not revert a password change when mail delivery throws', async () => {
-    const h = harness();
-    h.settings.RESEND_API_KEY = 'key';
-    h.settings.RESET_EMAIL_FROM = 'support@example.com';
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('SMTP unavailable')));
-    await expect(h.service.changePassword(UID, OLD, NEXT)).resolves.toMatchObject({
-      message: expect.stringContaining('Password changed'),
-    });
-    expect(warn).toHaveBeenCalled();
+  it('propagates outbox failure rather than claiming committed change', async () => {
+    const h = harness(); h.tx.securityNotification.create.mockRejectedValue(new Error('outbox unavailable'));
+    await expect(h.service.changePassword(UID, OLD, NEXT, SID)).rejects.toThrow('outbox unavailable');
+    expect(h.tx.authSession.updateMany).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -203,9 +181,26 @@ describe('AuthController change-password route', () => {
       auth as never, {} as never, {} as never, {} as never,
     );
     await expect(controller.changePassword(
-      { user: { id: UID } },
+      { user: { id: UID }, sessionId: SID },
       { currentPassword: OLD, newPassword: NEXT },
     )).resolves.toEqual({ message: 'done' });
-    expect(auth.changePassword).toHaveBeenCalledWith(UID, OLD, NEXT);
+    expect(auth.changePassword).toHaveBeenCalledWith(UID, OLD, NEXT, SID, undefined);
+  });
+});
+
+// Final coverage closeout
+
+describe('Password change final transaction boundary', () => {
+  it('rejects an account changed before acquiring the transaction lock', async () => {
+    const h = harness();
+    h.tx.user.findFirst.mockResolvedValue(null);
+
+    await expect(
+      h.service.changePassword(UID, OLD, NEXT, SID)
+    ).rejects.toThrow('Account changed');
+
+    expect(h.tx.user.updateMany).not.toHaveBeenCalled();
+    expect(h.tx.authSession.updateMany).not.toHaveBeenCalled();
+    expect(h.tx.securityNotification.create).not.toHaveBeenCalled();
   });
 });

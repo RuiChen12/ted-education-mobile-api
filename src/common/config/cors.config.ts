@@ -83,6 +83,7 @@ export function createCorsConfig(
       'Content-Type',
       'Authorization',
       'X-Request-ID',
+      'X-TED-Platform',
     ],
     exposedHeaders: ['X-Request-ID'],
     credentials: false,

@@ -5,7 +5,7 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { Throttle } from '@nestjs/throttler';
-import { JwtAuthGuard } from './jwt-auth.guard';
+import { JwtAuthGuard } from '../jwt/jwt-auth.guard';
 import { AvatarService } from './avatar.service';
 
 type AuthRequest = { user: { id: string } };

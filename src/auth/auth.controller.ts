@@ -1,5 +1,5 @@
-import { Get, Req, UseGuards } from '@nestjs/common';
-import { JwtAuthGuard } from './jwt-auth.guard';
+import { Get, Header, Req, UseGuards } from '@nestjs/common';
+import { JwtAuthGuard } from './jwt/jwt-auth.guard';
 import { Body, Controller, HttpCode, Post, Patch } from '@nestjs/common';
 import {
   ApiBadRequestResponse,
@@ -14,9 +14,9 @@ import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { GoogleLoginDto } from './dto/google-login.dto';
-import { GoogleAuthService } from './google-auth.service';
-import { PasswordResetService } from './password-reset.service';
-import { EmailVerificationService } from './email-verification.service';
+import { GoogleAuthService } from './google/google-auth.service';
+import { PasswordResetService } from './password/password-reset.service';
+import { EmailVerificationService } from './email/email-verification.service';
 import { RequestEmailVerificationDto } from './dto/request-email-verification.dto';
 import { ConfirmEmailVerificationDto } from './dto/confirm-email-verification.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
@@ -106,6 +106,7 @@ export class AuthController {
   }
 
   @Post('change-password')
+  @Header('Cache-Control', 'private, no-store')
   @HttpCode(200)
   @UseGuards(JwtAuthGuard)
   @Throttle({ default: { limit: 5, ttl: 60000 } })
@@ -113,13 +114,18 @@ export class AuthController {
     summary: 'Change password and revoke all sessions'
   })
   changePassword(
-    @Req() req: { user: { id: string } },
+    @Req() req: {
+      user: { id: string };
+      sessionId: string;
+    },
     @Body() dto: ChangePasswordDto,
   ) {
     return this.authService.changePassword(
       req.user.id,
       dto.currentPassword,
       dto.newPassword,
+      req.sessionId,
+      dto.mfaCode,
     );
   }
 
@@ -127,9 +133,16 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   @Throttle({ default: { limit: 30, ttl: 60000 } })
   profile(
-    @Req() req: { user: { id: string } },
-    @Body() dto: UpdateAccountDto
+    @Req() req: {
+      user: { id: string };
+      sessionId: string;
+    },
+    @Body() dto: UpdateAccountDto,
   ) {
-    return this.authService.updateAccount(req.user.id, dto);
+    return this.authService.updateAccount(
+      req.user.id,
+      dto,
+      req.sessionId,
+    );
   }
 }

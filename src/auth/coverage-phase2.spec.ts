@@ -13,8 +13,8 @@ import {
 import { Prisma } from '@prisma/client';
 import { createHmac } from 'node:crypto';
 
-import { GoogleAuthService } from './google-auth.service';
-import { PasswordResetService } from './password-reset.service';
+import { GoogleAuthService } from './google/google-auth.service';
+import { PasswordResetService } from './password/password-reset.service';
 
 const USER_ID = '11111111-1111-4111-8111-111111111111';
 const SUBJECT = 'google-subject-12345';
@@ -388,40 +388,22 @@ describe('Google first-time registration', () => {
 });
 
 function resetHarness() {
-  const prisma = {
-    user: {
-      findUnique: vi.fn().mockResolvedValue(null),
-    },
-    passwordResetCode: {
-      findUnique: vi.fn().mockResolvedValue(null),
-      upsert: vi.fn().mockResolvedValue({}),
-      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
-    },
-    $transaction: vi.fn(),
+  const user = { id: USER_ID, email: EMAIL, isActive: true, passwordHash: 'old-hash', sessionVersion: 3, emailVerifiedAt: new Date(), preferredLanguage: 'en', passwordResetSentInWindow: 0, passwordResetWindowStartedAt: null, passwordResetLastSentAt: null };
+  const tx = {
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    user: { findUnique: vi.fn().mockResolvedValue(user), update: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    passwordResetCode: { findUnique: vi.fn().mockResolvedValue(null), upsert: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({ count: 1 }), deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    authSession: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    emailChangeRequest: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    emailVerificationCode: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    googleActionChallenge: { updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    securityEvent: { create: vi.fn().mockResolvedValue({}) },
+    securityNotification: { create: vi.fn().mockResolvedValue({}) },
   };
-
-  const config = {
-    get: vi.fn((name: string) => {
-      if (name === 'RESEND_API_KEY') return 'test-api-key';
-      if (name === 'RESET_EMAIL_FROM') return 'test@example.com';
-      return undefined;
-    }),
-    getOrThrow: vi.fn().mockReturnValue(SECRET),
-  };
-
-  const service = new PasswordResetService(
-    prisma as never,
-    config as never,
-  );
-
-  const user = {
-    id: USER_ID,
-    email: EMAIL,
-    isActive: true,
-  };
-
-  return { prisma, config, service, user };
+  const prisma = { ...tx, user: { ...tx.user, findUnique: vi.fn().mockResolvedValue(null) }, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
+  const config = { get: vi.fn((name: string) => name === 'RESEND_API_KEY' ? 'test-api-key' : name === 'RESET_EMAIL_FROM' ? 'test@example.com' : undefined), getOrThrow: vi.fn().mockReturnValue(SECRET) };
+  const service = new PasswordResetService(prisma as never, config as never);
+  return { prisma, config, service, user, tx };
 }
 
 function mockFetch(
@@ -439,34 +421,11 @@ function mockFetch(
 
 function prepareValidReset() {
   const h = resetHarness();
-
   const codeHash = createHmac('sha256', SECRET)
-    .update('ted:reset:' + USER_ID + ':' + CODE)
-    .digest('hex');
-
+    .update(JSON.stringify(['ted:reset:v2', USER_ID, EMAIL, h.user.sessionVersion, CODE])).digest('hex');
   h.prisma.user.findUnique.mockResolvedValue(h.user);
-
-  h.prisma.passwordResetCode.findUnique.mockResolvedValue({
-    codeHash,
-    attempts: 0,
-    expiresAt: new Date(Date.now() + 600000),
-  });
-
-  const tx = {
-    passwordResetCode: {
-      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
-    },
-    user: {
-      update: vi.fn().mockResolvedValue({}),
-    },
-  };
-
-  h.prisma.$transaction.mockImplementation(
-    async (callback: (client: typeof tx) => Promise<unknown>) =>
-      callback(tx),
-  );
-
-  return { ...h, tx };
+  h.prisma.passwordResetCode.findUnique.mockResolvedValue({ codeHash, attempts: 0, sentAt: new Date(Date.now() - 1000), expiresAt: new Date(Date.now() + 600000) });
+  return h;
 }
 
 afterEach(() => {
@@ -477,10 +436,8 @@ describe('Password reset code delivery', () => {
   it('does not send mail to an inactive account', async () => {
     const h = resetHarness();
 
-    h.prisma.user.findUnique.mockResolvedValue({
-      ...h.user,
-      isActive: false,
-    });
+    h.prisma.user.findUnique.mockResolvedValue(h.user);
+    h.tx.user.findUnique.mockResolvedValue({ ...h.user, isActive: false });
 
     const fetchMock = mockFetch();
 
@@ -558,7 +515,7 @@ describe('Password reset code delivery', () => {
       .toHaveBeenCalledOnce();
   });
 
-  it('cleans up a code when the mail provider rejects it', async () => {
+  it('invalidates the undelivered code without deleting quota', async () => {
     const h = resetHarness();
 
     h.prisma.user.findUnique.mockResolvedValue(h.user);
@@ -572,8 +529,8 @@ describe('Password reset code delivery', () => {
 
     expect(result.message).toContain('If an eligible account exists');
 
-    expect(h.prisma.passwordResetCode.deleteMany)
-      .toHaveBeenCalledOnce();
+    expect(h.prisma.passwordResetCode.updateMany)
+      .toHaveBeenCalledWith(expect.objectContaining({ data: { expiresAt: expect.any(Date), attempts: 5 } }));
   });
 
   it('handles a mail network failure without exposing the user', async () => {
@@ -590,8 +547,8 @@ describe('Password reset code delivery', () => {
       h.service.requestCode(EMAIL),
     ).resolves.toHaveProperty('message');
 
-    expect(h.prisma.passwordResetCode.deleteMany)
-      .toHaveBeenCalledOnce();
+    expect(h.prisma.passwordResetCode.updateMany)
+      .toHaveBeenCalledWith(expect.objectContaining({ data: { expiresAt: expect.any(Date), attempts: 5 } }));
   });
 });
 
@@ -630,7 +587,7 @@ describe('Password reset validation and consumption', () => {
     ).rejects.toBeInstanceOf(BadRequestException);
 
     expect(h.prisma.passwordResetCode.updateMany)
-      .toHaveBeenCalledOnce();
+      .toHaveBeenCalledWith(expect.objectContaining({ data: { attempts: { increment: 1 } } }));
   });
 
   it('rejects reuse of a consumed reset code', async () => {
@@ -648,7 +605,7 @@ describe('Password reset validation and consumption', () => {
       ),
     ).rejects.toBeInstanceOf(BadRequestException);
 
-    expect(h.tx.user.update).not.toHaveBeenCalled();
+    expect(h.tx.user.updateMany).not.toHaveBeenCalled();
   });
 
   it('changes the password and invalidates old sessions', async () => {
@@ -669,9 +626,9 @@ describe('Password reset validation and consumption', () => {
     expect(h.tx.passwordResetCode.deleteMany)
       .toHaveBeenCalledOnce();
 
-    expect(h.tx.user.update).toHaveBeenCalledWith(
+    expect(h.tx.user.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: USER_ID },
+        where: expect.objectContaining({ id: USER_ID, email: EMAIL, sessionVersion: 3, passwordHash: h.user.passwordHash }),
         data: expect.objectContaining({
           passwordHash: expect.any(String),
           sessionVersion: { increment: 1 },
@@ -679,7 +636,9 @@ describe('Password reset validation and consumption', () => {
       }),
     );
 
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(h.tx.authSession.updateMany).toHaveBeenCalledWith({ where: { userId: USER_ID, revokedAt: null }, data: { revokedAt: expect.any(Date) } });
+    expect(h.tx.securityNotification.create).toHaveBeenCalledWith({ data: { userId: USER_ID, recipient: EMAIL, kind: 'PASSWORD_RESET', language: 'en' } });
   });
 
   it('succeeds even if the notification email is unavailable', async () => {
@@ -703,7 +662,7 @@ describe('Password reset validation and consumption', () => {
       'Password changed. Sign in again.',
     );
 
-    expect(h.tx.user.update).toHaveBeenCalledOnce();
+    expect(h.tx.user.updateMany).toHaveBeenCalledOnce();
   });
 
   it('does not require mail settings to finish a password change', async () => {
@@ -723,7 +682,7 @@ describe('Password reset validation and consumption', () => {
 
     expect(fetchMock).not.toHaveBeenCalled();
 
-    expect(h.tx.user.update).toHaveBeenCalledOnce();
+    expect(h.tx.user.updateMany).toHaveBeenCalledOnce();
   });
 
   it('does not fail when notification provider returns HTTP 500', async () => {
@@ -769,12 +728,12 @@ describe('Coverage phase 3 remaining edge cases', () => {
     );
   });
 
-  it('survives failure when deleting an undelivered reset code', async () => {
+  it('survives failure when invalidating an undelivered reset code', async () => {
     const h = resetHarness();
 
     h.prisma.user.findUnique.mockResolvedValue(h.user);
 
-    h.prisma.passwordResetCode.deleteMany.mockRejectedValue(
+    h.prisma.passwordResetCode.updateMany.mockRejectedValue(
       new Error('Cleanup unavailable'),
     );
 
@@ -787,8 +746,8 @@ describe('Coverage phase 3 remaining edge cases', () => {
       h.service.requestCode(EMAIL),
     ).resolves.toHaveProperty('message');
 
-    expect(h.prisma.passwordResetCode.deleteMany)
-      .toHaveBeenCalledOnce();
+    expect(h.prisma.passwordResetCode.updateMany)
+      .toHaveBeenCalledWith(expect.objectContaining({ data: { expiresAt: expect.any(Date), attempts: 5 } }));
   });
 
   it('handles non-Error exceptions from the email transport', async () => {
@@ -805,7 +764,120 @@ describe('Coverage phase 3 remaining edge cases', () => {
       h.service.requestCode(EMAIL),
     ).resolves.toHaveProperty('message');
 
-    expect(h.prisma.passwordResetCode.deleteMany)
-      .toHaveBeenCalledOnce();
+    expect(h.prisma.passwordResetCode.updateMany)
+      .toHaveBeenCalledWith(expect.objectContaining({ data: { expiresAt: expect.any(Date), attempts: 5 } }));
+  });
+});
+
+// Final coverage closeout
+
+describe('Final password reset quota and concurrency boundaries', () => {
+  it.each([2, 5])(
+    'preserves account-level hourly quota with %s sends',
+    async count => {
+      const h = resetHarness();
+      const started = new Date(Date.now() - 180000);
+
+      h.prisma.user.findUnique.mockResolvedValue(h.user);
+
+      h.tx.user.findUnique.mockResolvedValue({
+        ...h.user,
+        passwordResetWindowStartedAt: started,
+        passwordResetSentInWindow: count,
+        passwordResetLastSentAt: new Date(Date.now() - 120000)
+      });
+
+      const send = mockFetch();
+
+      await h.service.requestCode(EMAIL);
+
+      if (count === 5) {
+        expect(send).not.toHaveBeenCalled();
+        expect(h.tx.passwordResetCode.upsert).not.toHaveBeenCalled();
+      } else {
+        expect(send).toHaveBeenCalledOnce();
+
+        expect(h.tx.user.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              passwordResetSentInWindow: count + 1,
+              passwordResetWindowStartedAt: started
+            })
+          })
+        );
+      }
+    }
+  );
+
+  it('does not invalidate proof after an undelivered request loses its owner', async () => {
+    const h = resetHarness();
+
+    h.prisma.user.findUnique.mockResolvedValue(h.user);
+
+    h.tx.user.findUnique
+      .mockResolvedValueOnce(h.user)
+      .mockResolvedValueOnce(null);
+
+    mockFetch({ ok: false, status: 500 });
+
+    await expect(h.service.requestCode(EMAIL))
+      .resolves.toHaveProperty('message');
+
+    expect(h.tx.passwordResetCode.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed reset proof before account lookup', async () => {
+    const h = resetHarness();
+
+    await expect(h.service.resetPassword(
+      EMAIL, 'invalid', 'NewPassword123!'
+    )).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(h.prisma.user.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('rejects reset after account disappearance', async () => {
+    const h = prepareValidReset();
+
+    h.prisma.user.findUnique.mockResolvedValue(h.user);
+    h.tx.user.findUnique.mockResolvedValue(null);
+
+    await expect(h.service.resetPassword(
+      EMAIL, CODE, 'NewPassword123!'
+    )).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(h.tx.user.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects a changed account between proof validation and password commit', async () => {
+    const h = prepareValidReset();
+
+    h.prisma.user.findUnique.mockResolvedValue(h.user);
+
+    h.tx.user.findUnique
+      .mockResolvedValueOnce(h.user)
+      .mockResolvedValueOnce({
+        ...h.user, sessionVersion: h.user.sessionVersion + 1
+      });
+
+    await expect(h.service.resetPassword(
+      EMAIL, CODE, 'NewPassword123!'
+    )).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(h.tx.user.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects lost password-reset compare-and-set', async () => {
+    const h = prepareValidReset();
+
+    h.prisma.user.findUnique.mockResolvedValue(h.user);
+    h.tx.user.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(h.service.resetPassword(
+      EMAIL, CODE, 'NewPassword123!'
+    )).rejects.toBeInstanceOf(BadRequestException);
+
+    expect(h.tx.authSession.updateMany).not.toHaveBeenCalled();
+    expect(h.tx.securityNotification.create).not.toHaveBeenCalled();
   });
 });

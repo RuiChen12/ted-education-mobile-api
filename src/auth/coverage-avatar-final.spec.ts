@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('@aws-sdk/client-s3', () => {
   class S3Client {
+    destroy() {}
     constructor(config: Record<string, unknown>) { mocks.clients.push(config); }
     send(command: unknown) { return mocks.send(command); }
   }
@@ -36,13 +37,13 @@ vi.mock('sharp', () => ({ default: (...args: unknown[]) => mocks.sharp(...args) 
 import {
   PutObjectCommand, DeleteObjectCommand, GetObjectCommand,
 } from '@aws-sdk/client-s3';
-import { AvatarService } from './avatar.service';
-import { AvatarController } from './avatar.controller';
+import { AvatarService } from './avatar/avatar.service';
+import { AvatarController } from './avatar/avatar.controller';
 
 const UID = '11111111-1111-4111-8111-111111111111';
 const ACCOUNT = 'a'.repeat(32);
 const BUCKET = 'ted-profile-avatars';
-const GOOD_KEY = `avatars/${UID}/existing.jpg`;
+const GOOD_KEY = `avatars/${UID}/22222222-2222-4222-8222-222222222222.jpg`;
 const FOREIGN_KEY = 'avatars/another-user/not-ours.jpg';
 const URL = 'https://signed.example.test/avatar.jpg';
 const PHOTO = { buffer: Buffer.from('fake-but-mocked-image'), size: 21, mimetype: 'image/png' };
@@ -81,12 +82,14 @@ function harness() {
     R2_SECRET_ACCESS_KEY: 'test-secret-key',
   };
   const config = { get: vi.fn((key: string) => settings[key]) };
-  const prisma = {
+  const tx = {
+    avatarCleanupJob: { create: vi.fn().mockResolvedValue({}), deleteMany: vi.fn().mockResolvedValue({ count: 1 }), upsert: vi.fn().mockResolvedValue({}) },
     user: {
       findUnique: vi.fn().mockResolvedValue({ avatarUrl: null as string | null }),
       updateMany: vi.fn().mockResolvedValue({ count: 1 }),
     },
   };
+  const prisma = { ...tx, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
   const service = new AvatarService(prisma as never, config as never);
   return { service, prisma, config, settings };
 }
@@ -213,13 +216,16 @@ describe('R2 avatar upload, replace, and failure cleanup', () => {
       Key: expect.stringMatching(/^avatars\/11111111-1111-4111-8111-111111111111\/[a-f0-9-]+\.jpg$/),
       Body: Buffer.from('jpeg-bytes'),
       ContentType: 'image/jpeg',
-      CacheControl: 'private, max-age=300',
+      CacheControl: 'private, no-store',
     });
     expect(h.prisma.user.updateMany).toHaveBeenCalledWith({
       where: { id: UID, avatarUrl: null },
       data: { avatarUrl: put[0].input.Key },
     });
     expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
+    expect(h.prisma.avatarCleanupJob.create).toHaveBeenCalledWith({ data: { objectKey: put[0].input.Key, notBefore: expect.any(Date) } });
+    expect(h.prisma.avatarCleanupJob.deleteMany).toHaveBeenCalledWith({ where: { objectKey: put[0].input.Key, attempts: 0, notBefore: { gt: expect.any(Date) } } });
+    expect(h.prisma.$transaction).toHaveBeenCalledOnce();
   });
 
   it('refuses upload when the account is missing', async () => {
@@ -244,26 +250,24 @@ describe('R2 avatar upload, replace, and failure cleanup', () => {
     expect(h.prisma.user.updateMany).not.toHaveBeenCalled();
   });
 
-  it('cleans up an uploaded object if the database throws', async () => {
+  it('retains the orphan cleanup reservation if the database throws', async () => {
     const h = harness();
     h.prisma.user.updateMany.mockRejectedValue(new Error('DB unavailable'));
     await expect(h.service.upload(UID, PHOTO)).rejects.toThrow('DB unavailable');
     expect(commandsOf(PutObjectCommand)).toHaveLength(1);
-    expect(commandsOf(DeleteObjectCommand)).toHaveLength(1);
-    expect(commandsOf(DeleteObjectCommand)[0].input.Key)
-      .toEqual(commandsOf(PutObjectCommand)[0].input.Key);
+    expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
+    expect(h.prisma.avatarCleanupJob.create).toHaveBeenCalledWith({ data: { objectKey: commandsOf(PutObjectCommand)[0].input.Key, notBefore: expect.any(Date) } });
   });
 
-  it('cleans up the new object when a concurrent update wins', async () => {
+  it('retains the orphan cleanup reservation after a concurrent update', async () => {
     const h = harness();
     h.prisma.user.updateMany.mockResolvedValue({ count: 0 });
     await expect(h.service.upload(UID, PHOTO)).rejects.toBeInstanceOf(ConflictException);
-    expect(commandsOf(DeleteObjectCommand)).toHaveLength(1);
-    expect(commandsOf(DeleteObjectCommand)[0].input.Key)
-      .toEqual(commandsOf(PutObjectCommand)[0].input.Key);
+    expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
+    expect(h.prisma.avatarCleanupJob.create).toHaveBeenCalledWith({ data: { objectKey: commandsOf(PutObjectCommand)[0].input.Key, notBefore: expect.any(Date) } });
   });
 
-  it('replaces a stored avatar and best-effort deletes only the old owned key', async () => {
+  it('replaces a stored avatar and queues only the old owned key', async () => {
     const h = harness();
     h.prisma.user.findUnique.mockResolvedValue({ avatarUrl: GOOD_KEY });
     await expect(h.service.upload(UID, PHOTO)).resolves.toEqual({ url: URL });
@@ -271,8 +275,8 @@ describe('R2 avatar upload, replace, and failure cleanup', () => {
       where: { id: UID, avatarUrl: GOOD_KEY },
       data: { avatarUrl: expect.stringContaining(`avatars/${UID}/`) },
     });
-    expect(commandsOf(DeleteObjectCommand)).toHaveLength(1);
-    expect(commandsOf(DeleteObjectCommand)[0].input.Key).toBe(GOOD_KEY);
+    expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
+    expect(h.prisma.avatarCleanupJob.upsert).toHaveBeenCalledWith({ where: { objectKey: GOOD_KEY }, create: { objectKey: GOOD_KEY, notBefore: expect.any(Date) }, update: {} });
   });
 
   it('never deletes a foreign key while replacing an avatar', async () => {
@@ -282,20 +286,20 @@ describe('R2 avatar upload, replace, and failure cleanup', () => {
     expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
   });
 
-  it('does not fail an already-saved avatar when stale-object cleanup fails', async () => {
-    const h = harness();
-    h.prisma.user.findUnique.mockResolvedValue({ avatarUrl: GOOD_KEY });
+  it('does not perform stale-object deletion inline after upload', async () => {
+    const h = harness(); h.prisma.user.findUnique.mockResolvedValue({ avatarUrl: GOOD_KEY });
     mocks.send.mockResolvedValueOnce({}).mockRejectedValueOnce(new Error('cleanup failed'));
     await expect(h.service.upload(UID, PHOTO)).resolves.toEqual({ url: URL });
-    expect(commandsOf(DeleteObjectCommand)).toHaveLength(1);
+    expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
+    expect(h.prisma.avatarCleanupJob.upsert).toHaveBeenCalledOnce();
   });
 
-  it('documents the current post-commit signed-URL failure behavior', async () => {
-    const h = harness();
-    mocks.signedUrl.mockRejectedValueOnce(new Error('cannot sign URL'));
+  it('does not commit an avatar pointer if signing fails', async () => {
+    const h = harness(); mocks.signedUrl.mockRejectedValueOnce(new Error('cannot sign URL'));
     await expect(h.service.upload(UID, PHOTO)).rejects.toThrow('cannot sign URL');
-    // This identifies a product defect; the DB already points at the new key.
-    expect(h.prisma.user.updateMany).toHaveBeenCalledTimes(1);
+    expect(h.prisma.user.updateMany).not.toHaveBeenCalled();
+    expect(h.prisma.avatarCleanupJob.create).toHaveBeenCalledOnce();
+    expect(h.prisma.$transaction).not.toHaveBeenCalled();
   });
 });
 
@@ -328,8 +332,8 @@ describe('R2 avatar deletion', () => {
     expect(h.prisma.user.updateMany).toHaveBeenCalledWith({
       where: { id: UID, avatarUrl: GOOD_KEY }, data: { avatarUrl: null },
     });
-    expect(commandsOf(DeleteObjectCommand)[0].input)
-      .toEqual({ Bucket: BUCKET, Key: GOOD_KEY });
+    expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
+    expect(h.prisma.avatarCleanupJob.upsert).toHaveBeenCalledWith({ where: { objectKey: GOOD_KEY }, create: { objectKey: GOOD_KEY, notBefore: expect.any(Date) }, update: {} });
   });
 
   it('clears legacy or foreign references without deleting unrelated objects', async () => {
@@ -337,14 +341,15 @@ describe('R2 avatar deletion', () => {
     h.prisma.user.findUnique.mockResolvedValue({ avatarUrl: FOREIGN_KEY });
     await expect(h.service.remove(UID)).resolves.toEqual({ url: null });
     expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
+    expect(h.prisma.avatarCleanupJob.upsert).not.toHaveBeenCalled();
   });
 
-  it('keeps the delete action successful even if R2 cleanup fails', async () => {
-    const h = harness();
-    h.prisma.user.findUnique.mockResolvedValue({ avatarUrl: GOOD_KEY });
+  it('does not require R2 availability to queue avatar deletion', async () => {
+    const h = harness(); h.prisma.user.findUnique.mockResolvedValue({ avatarUrl: GOOD_KEY });
     mocks.send.mockRejectedValue(new Error('R2 cleanup failed'));
     await expect(h.service.remove(UID)).resolves.toEqual({ url: null });
-    expect(commandsOf(DeleteObjectCommand)).toHaveLength(1);
+    expect(commandsOf(DeleteObjectCommand)).toHaveLength(0);
+    expect(h.prisma.avatarCleanupJob.upsert).toHaveBeenCalledOnce();
   });
 });
 
@@ -363,5 +368,31 @@ describe('AvatarController routes', () => {
     expect(api.get).toHaveBeenCalledWith(UID);
     expect(api.upload).toHaveBeenCalledWith(UID, PHOTO);
     expect(api.remove).toHaveBeenCalledWith(UID);
+  });
+});
+
+// Final coverage closeout
+
+describe('Final avatar upload authorization boundaries', () => {
+  it('rejects an invalid owner reference before object upload', async () => {
+    const h = harness();
+
+    await expect(h.service.upload('invalid-user', PHOTO))
+      .rejects.toBeInstanceOf(BadRequestException);
+
+    expect(h.prisma.avatarCleanupJob.create).not.toHaveBeenCalled();
+    expect(commandsOf(PutObjectCommand)).toHaveLength(0);
+  });
+
+  it('does not commit an expired cleanup reservation', async () => {
+    const h = harness();
+
+    h.prisma.avatarCleanupJob.deleteMany.mockResolvedValue({ count: 0 });
+
+    await expect(h.service.upload(UID, PHOTO))
+      .rejects.toBeInstanceOf(ConflictException);
+
+    expect(h.prisma.user.updateMany).not.toHaveBeenCalled();
+    expect(h.prisma.avatarCleanupJob.create).toHaveBeenCalledOnce();
   });
 });

@@ -1,3 +1,6 @@
+import { PrismaModule } from './prisma/prisma.module';
+import { PrismaService } from './prisma/prisma.service';
+import { PostgresRateLimitStorage } from './common/config/postgres-rate-limit.storage';
 
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
@@ -28,9 +31,25 @@ import { TreatmentsModule } from './treatments/treatments.module';
     }),
 
     ThrottlerModule.forRootAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: createRateLimitConfig,
+      imports: [ConfigModule, PrismaModule],
+      inject: [ConfigService, PrismaService],
+      useFactory: (
+        config: ConfigService,
+        prisma: PrismaService,
+      ) => {
+        const options = createRateLimitConfig(config);
+
+        if (!Array.isArray(options)) {
+          throw new Error(
+            'Unexpected rate limit configuration.',
+          );
+        }
+
+        return {
+          throttlers: options,
+          storage: new PostgresRateLimitStorage(prisma),
+        };
+      },
     }),
 
     ObserveModule.forRootAsync({

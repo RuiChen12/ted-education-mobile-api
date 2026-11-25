@@ -209,7 +209,7 @@ describe('API-005 Global Exception Handling (e2e)', () => {
     );
     expect(response.body.error.status).toBe(503);
     expect(response.body.error.message).toBe(
-      'An internal error occurred.',
+      'The service is temporarily unavailable. Check the operation status before retrying.',
     );
 
     expect(response.body.error.requestId).toBe(

@@ -8,10 +8,10 @@ import type { ExecutionContext } from '@nestjs/common';
 import { createHmac } from 'node:crypto';
 
 import { AuthController } from './auth.controller';
-import { AuthSessionController } from './auth-session.controller';
-import { AuthSessionService } from './auth-session.service';
-import { EmailVerificationService } from './email-verification.service';
-import { JwtAuthGuard } from './jwt-auth.guard';
+import { AuthSessionController } from './sessions/auth-session.controller';
+import { AuthSessionService } from './sessions/auth-session.service';
+import { EmailVerificationService } from './email/email-verification.service';
+import { JwtAuthGuard } from './jwt/jwt-auth.guard';
 
 const SID = '11111111-1111-4111-8111-111111111111';
 const UID = '22222222-2222-4222-8222-222222222222';
@@ -25,9 +25,9 @@ const TOKEN_HASH = createHmac('sha256', SECRET)
   .update('ted:refresh:' + TOKEN)
   .digest('hex');
 
+const SENT_AT = new Date(Date.now() - 120000);
 const CODE_HASH = createHmac('sha256', SECRET)
-  .update('ted:verify-email:' + UID + ':' + CODE)
-  .digest('hex');
+  .update(JSON.stringify(['ted:verify-email:v2', UID, EMAIL, 3, SENT_AT.toISOString(), CODE])).digest('hex');
 
 function validSession() {
   return {
@@ -49,44 +49,18 @@ function validSession() {
 }
 
 function sessionHarness() {
+  const owner = vi.fn().mockResolvedValue(validSession());
   const tx = {
-    authSession: {
-      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-    },
-    usedRefreshToken: {
-      create: vi.fn().mockResolvedValue({}),
-    },
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    user: { findUnique: vi.fn(async () => (await owner())?.user) },
+    authSession: { findFirst: vi.fn(async () => owner()), create: vi.fn().mockResolvedValue({}), updateMany: vi.fn().mockResolvedValue({ count: 1 }), deleteMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    usedRefreshToken: { create: vi.fn().mockResolvedValue({}), findUnique: vi.fn().mockResolvedValue(null) },
+    securityEvent: { create: vi.fn().mockResolvedValue({}) },
   };
-
-  const prisma = {
-    authSession: {
-      create: vi.fn().mockResolvedValue({}),
-      findUnique: vi.fn().mockResolvedValue(validSession()),
-      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
-    },
-    usedRefreshToken: {
-      findUnique: vi.fn().mockResolvedValue(null),
-    },
-    $transaction: vi.fn(
-      async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx),
-    ),
-  };
-
-  const jwt = {
-    signAsync: vi.fn().mockResolvedValue('signed-access'),
-  };
-
-  const config = {
-    getOrThrow: vi.fn().mockReturnValue(SECRET),
-  };
-
-  const service = new AuthSessionService(
-    prisma as never,
-    jwt as never,
-    config as never,
-  );
-
+  const prisma = { ...tx, authSession: { ...tx.authSession, findUnique: owner }, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
+  const jwt = { signAsync: vi.fn().mockResolvedValue('signed-access') };
+  const config = { getOrThrow: vi.fn().mockReturnValue(SECRET) };
+  const service = new AuthSessionService(prisma as never, jwt as never, config as never);
   return { service, prisma, jwt, tx };
 }
 
@@ -95,6 +69,7 @@ function validUser() {
     id: UID,
     isActive: true,
     passwordHash: 'hashed-password' as string | null,
+    email: EMAIL, sessionVersion: 3,
     emailVerifiedAt: null as Date | null,
   };
 }
@@ -102,7 +77,7 @@ function validUser() {
 function validRecord() {
   return {
     userId: UID,
-    codeHash: CODE_HASH,
+    codeHash: CODE_HASH, sentAt: SENT_AT, sentInWindow: 1, windowStartedAt: SENT_AT,
     attempts: 0,
     expiresAt: new Date(Date.now() + 600000),
   };
@@ -110,42 +85,15 @@ function validRecord() {
 
 function emailHarness() {
   const tx = {
-    emailVerificationCode: {
-      deleteMany: vi.fn().mockResolvedValue({ count: 1 }),
-    },
-    user: {
-      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-    },
+    $queryRaw: vi.fn().mockResolvedValue([]),
+    user: { findUnique: vi.fn().mockResolvedValue(validUser()), updateMany: vi.fn().mockResolvedValue({ count: 1 }) },
+    emailVerificationCode: { findUnique: vi.fn().mockResolvedValue(validRecord()), updateMany: vi.fn().mockResolvedValue({ count: 1 }), upsert: vi.fn().mockResolvedValue({}) },
   };
-
-  const prisma = {
-    user: {
-      findUnique: vi.fn().mockResolvedValue(validUser()),
-    },
-    $queryRaw: vi.fn().mockResolvedValue([{ userId: UID }]),
-    emailVerificationCode: {
-      findUnique: vi.fn().mockResolvedValue(validRecord()),
-      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
-    },
-    $transaction: vi.fn(
-      async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx),
-    ),
-  };
-
-  const config = {
-    get: vi.fn((key: string): string | undefined => {
-      if (key === 'RESEND_API_KEY') return 'test-api-key';
-      if (key === 'RESET_EMAIL_FROM') return 'verify@example.com';
-      return undefined;
-    }),
-    getOrThrow: vi.fn().mockReturnValue(SECRET),
-  };
-
-  const service = new EmailVerificationService(
-    prisma as never,
-    config as never,
-  );
-
+  const owner = vi.fn().mockResolvedValue(validUser());
+  tx.user.findUnique.mockImplementation(async () => owner());
+  const prisma = { ...tx, user: { ...tx.user, findUnique: owner }, $transaction: vi.fn(async (fn: (client: typeof tx) => Promise<unknown>) => fn(tx)) };
+  const config = { get: vi.fn((key: string): string | undefined => key === 'RESEND_API_KEY' ? 'test-api-key' : key === 'RESET_EMAIL_FROM' ? 'verify@example.com' : undefined), getOrThrow: vi.fn().mockReturnValue(SECRET) };
+  const service = new EmailVerificationService(prisma as never, config as never);
   return { service, prisma, config, tx };
 }
 
@@ -248,12 +196,12 @@ describe('Session controller route coverage', () => {
     );
 
     await expect(
-      controller.logoutAll({ user: { id: UID } }),
+      controller.logoutAll({ user: { id: UID }, sessionId: SID }),
     ).resolves.toEqual({
       message: 'All sessions revoked.',
     });
 
-    expect(sessions.logoutAll).toHaveBeenCalledWith(UID);
+    expect(sessions.logoutAll).toHaveBeenCalledWith(UID, SID);
   });
 });
 
@@ -309,21 +257,12 @@ describe('Session service security coverage', () => {
     expect(helper.hashEquals(TOKEN_HASH, TOKEN_HASH)).toBe(true);
   });
 
-  it('deletes a newly created session if JWT signing fails', async () => {
-    const h = sessionHarness();
-
-    h.jwt.signAsync.mockRejectedValue(
-      new Error('sign failed'),
-    );
-
-    await expect(
-      h.service.issue(UID, 3),
-    ).rejects.toThrow('sign failed');
-
-    expect(h.prisma.authSession.deleteMany)
-      .toHaveBeenCalledWith({
-        where: { id: expect.any(String) },
-      });
+  it('does not claim a successful session when JWT signing fails inside transaction', async () => {
+    const h = sessionHarness(); h.jwt.signAsync.mockRejectedValue(new Error('sign failed'));
+    await expect(h.service.issue(UID, 3)).rejects.toThrow('sign failed');
+    expect(h.prisma.$transaction).toHaveBeenCalledOnce();
+    expect(h.tx.authSession.create).toHaveBeenCalledOnce();
+    expect(h.tx.authSession.deleteMany).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -375,7 +314,8 @@ describe('Session service security coverage', () => {
       h.service.refresh(TOKEN),
     ).rejects.toBeInstanceOf(UnauthorizedException);
 
-    expect(h.prisma.$transaction).not.toHaveBeenCalled();
+    expect(h.tx.authSession.updateMany).not.toHaveBeenCalled();
+    expect(h.tx.usedRefreshToken.create).not.toHaveBeenCalled();
   });
 
   it('rotates token for verified password accounts', async () => {
@@ -461,7 +401,7 @@ describe('Session service security coverage', () => {
       .not.toHaveBeenCalled();
 
     expect(h.prisma.usedRefreshToken.findUnique)
-      .toHaveBeenCalledOnce();
+      .not.toHaveBeenCalled();
   });
 
   it('rejects unexpected transaction failures', async () => {
@@ -473,10 +413,10 @@ describe('Session service security coverage', () => {
 
     await expect(
       h.service.refresh(TOKEN),
-    ).rejects.toBeInstanceOf(UnauthorizedException);
+    ).rejects.toThrow('DB rejected');
 
     expect(h.prisma.usedRefreshToken.findUnique)
-      .toHaveBeenCalledOnce();
+      .not.toHaveBeenCalled();
   });
 
   it('limits rolling refresh expiry to seven days', async () => {
@@ -568,14 +508,13 @@ describe('Email verification send coverage', () => {
 
     expect(result.message).toContain('code');
 
-    expect(h.prisma.$queryRaw)
-      .not.toHaveBeenCalled();
+    expect(h.tx.emailVerificationCode.upsert).not.toHaveBeenCalled();
   });
 
   it('does not send when the quota blocks the request', async () => {
     const h = emailHarness();
 
-    h.prisma.$queryRaw.mockResolvedValue([]);
+    h.tx.emailVerificationCode.findUnique.mockResolvedValue({ ...validRecord(), sentAt: new Date(Date.now()-120000), windowStartedAt: new Date(Date.now()-120000), sentInWindow: 5 });
 
     const send = vi.fn();
     vi.stubGlobal('fetch', send);
@@ -720,8 +659,8 @@ describe('Email verification confirmation coverage', () => {
       h.service.confirmCode(EMAIL, CODE),
     ).rejects.toBeInstanceOf(BadRequestException);
 
-    expect(h.prisma.$transaction)
-      .not.toHaveBeenCalled();
+    expect(h.tx.user.updateMany).not.toHaveBeenCalled();
+    expect(h.tx.emailVerificationCode.updateMany).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -756,7 +695,7 @@ describe('Email verification confirmation coverage', () => {
   it('rejects a concurrently consumed code', async () => {
     const h = emailHarness();
 
-    h.tx.emailVerificationCode.deleteMany
+    h.tx.emailVerificationCode.updateMany
       .mockResolvedValue({ count: 0 });
 
     await expect(
@@ -778,7 +717,7 @@ describe('Email verification confirmation coverage', () => {
       h.service.confirmCode(EMAIL, CODE),
     ).rejects.toBeInstanceOf(BadRequestException);
 
-    expect(h.tx.emailVerificationCode.deleteMany)
+    expect(h.tx.emailVerificationCode.updateMany)
       .toHaveBeenCalledOnce();
   });
 
@@ -792,7 +731,7 @@ describe('Email verification confirmation coverage', () => {
       'Email verified. You can now sign in.',
     );
 
-    expect(h.tx.emailVerificationCode.deleteMany)
+    expect(h.tx.emailVerificationCode.updateMany)
       .toHaveBeenCalledOnce();
 
     expect(h.tx.user.updateMany)
@@ -821,9 +760,7 @@ function guardHarness() {
         userId: UID,
         sessionVersion: 3,
         revokedAt: null,
-        expiresAt: new Date(
-          Date.now() + 60000,
-        ),
+        expiresAt: new Date(Date.now() + 60000), absoluteExpiresAt: new Date(Date.now() + 120000), lastActiveAt: new Date(),
       }),
     },
     user: {
@@ -843,7 +780,7 @@ function guardHarness() {
       sub: UID,
       sid: SID,
       purpose: 'access',
-      sv: 3,
+      sv: 3, exp: Math.floor(Date.now() / 1000) + 600,
     }),
   };
 
@@ -926,5 +863,60 @@ describe('JWT Guard remaining coverage', () => {
       id: UID,
       email: EMAIL,
     });
+  });
+});
+
+// Final coverage closeout
+
+describe('Final verification and session boundaries', () => {
+  it('does not send another verification email during cooldown', async () => {
+    const h = emailHarness();
+    h.tx.emailVerificationCode.findUnique.mockResolvedValue({
+      ...validRecord(),
+      sentAt: new Date()
+    });
+
+    const send = vi.fn();
+    vi.stubGlobal('fetch', send);
+
+    await expect(h.service.requestCode(EMAIL))
+      .resolves.toHaveProperty('message');
+
+    expect(h.tx.emailVerificationCode.upsert).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '1234567', 'abcdefgh'])(
+    'rejects malformed verification code %s',
+    async code => {
+      const h = emailHarness();
+
+      await expect(h.service.confirmCode(EMAIL, code))
+        .rejects.toBeInstanceOf(BadRequestException);
+
+      expect(h.prisma.user.findUnique).not.toHaveBeenCalled();
+    }
+  );
+
+  it('does not emit another replay audit when the session is already revoked', async () => {
+    const h = sessionHarness();
+
+    h.tx.authSession.findFirst.mockResolvedValue({
+      ...validSession(),
+      tokenHash: 'b'.repeat(64)
+    });
+
+    h.tx.usedRefreshToken.findUnique.mockResolvedValue({
+      sessionId: SID,
+      usedAt: new Date(Date.now() - 30000)
+    });
+
+    h.tx.authSession.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(h.service.refresh(TOKEN))
+      .rejects.toBeInstanceOf(UnauthorizedException);
+
+    expect(h.tx.securityEvent.create).not.toHaveBeenCalled();
+    expect(h.tx.usedRefreshToken.create).not.toHaveBeenCalled();
   });
 });

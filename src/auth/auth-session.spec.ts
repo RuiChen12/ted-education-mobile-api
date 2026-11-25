@@ -10,7 +10,7 @@ import {
 } from '@nestjs/common';
 
 import { createHmac } from 'node:crypto';
-import { AuthSessionService } from './auth-session.service';
+import { AuthSessionService } from './sessions/auth-session.service';
 
 const id =
   '11111111-1111-4111-8111-111111111111';
@@ -48,10 +48,25 @@ function setup() {
     },
   };
 
-  const prisma = {
+  const tx = {
+    $queryRaw: vi.fn().mockResolvedValue([]),
+
+    user: {
+      findUnique: vi.fn().mockResolvedValue({
+        ...session.user,
+        email: 'patient@example.test',
+        preferredLanguage: 'en',
+      }),
+
+      updateMany: vi.fn().mockResolvedValue({
+        count: 1,
+      }),
+    },
+
     authSession: {
       create: vi.fn().mockResolvedValue(session),
       findUnique: vi.fn().mockResolvedValue(session),
+      findFirst: vi.fn().mockResolvedValue(session),
       updateMany: vi.fn().mockResolvedValue({
         count: 1,
       }),
@@ -59,23 +74,26 @@ function setup() {
         count: 1,
       }),
     },
+
     usedRefreshToken: {
       findUnique: vi.fn().mockResolvedValue(null),
+      create: vi.fn().mockResolvedValue({}),
     },
+
+    securityEvent: {
+      create: vi.fn().mockResolvedValue({}),
+    },
+
+    securityNotification: {
+      create: vi.fn().mockResolvedValue({}),
+    },
+  };
+
+  const prisma = {
+    ...tx,
     $transaction: vi.fn(
-      async (
-        fn: (tx: unknown) => Promise<unknown>,
-      ) =>
-        fn({
-          authSession: {
-            updateMany: vi.fn().mockResolvedValue({
-              count: 1,
-            }),
-          },
-          usedRefreshToken: {
-            create: vi.fn().mockResolvedValue({}),
-          },
-        }),
+      async (fn: (client: typeof tx) => Promise<unknown>) =>
+        fn(tx),
     ),
   };
 
@@ -112,6 +130,13 @@ describe('Refresh token sessions', () => {
       prisma.authSession.create,
     ).toHaveBeenCalledTimes(1);
 
+    expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRaw).toHaveBeenCalled();
+
+    expect(prisma.securityEvent.create).toHaveBeenCalledWith({
+      data: { userId, type: 'SESSION_CREATED' },
+    });
+
     expect(jwt.signAsync).toHaveBeenCalledWith(
       expect.objectContaining({
         sub: userId,
@@ -147,7 +172,7 @@ describe('Refresh token sessions', () => {
     const original =
       await prisma.authSession.findUnique();
 
-    prisma.authSession.findUnique
+    prisma.authSession.findFirst
       .mockResolvedValueOnce({
         ...original,
         tokenHash: 'b'.repeat(64),
@@ -156,6 +181,7 @@ describe('Refresh token sessions', () => {
     prisma.usedRefreshToken.findUnique
       .mockResolvedValue({
         sessionId: id,
+        usedAt: new Date(Date.now() - 30000),
       });
 
     await expect(
@@ -189,7 +215,30 @@ describe('Refresh token sessions', () => {
   it('revokes all user sessions', async () => {
     const { service, prisma } = setup();
 
-    await service.logoutAll(userId);
+    await service.logoutAll(userId, id);
+
+    expect(prisma.user.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          id: userId,
+          isActive: true,
+          sessionVersion: 3,
+        },
+        data: {
+          sessionVersion: { increment: 1 },
+        },
+      }),
+    );
+
+    expect(prisma.securityNotification.create)
+      .toHaveBeenCalledWith({
+        data: {
+          userId,
+          recipient: 'patient@example.test',
+          kind: 'ALL_SESSIONS_REVOKED',
+          language: 'en',
+        },
+      });
 
     expect(
       prisma.authSession.updateMany,

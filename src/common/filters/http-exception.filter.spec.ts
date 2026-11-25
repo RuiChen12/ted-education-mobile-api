@@ -150,7 +150,7 @@ describe('API-005/007 HttpExceptionFilter (unit)', () => {
         new HttpException('SECRET_DATABASE_ERROR', 503),
         503,
         'INTERNAL_SERVER_ERROR',
-        'An internal error occurred.',
+        'The service is temporarily unavailable. Check the operation status before retrying.',
       ],
     ])(
       'maps %s correctly',
